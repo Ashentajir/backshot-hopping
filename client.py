@@ -291,6 +291,9 @@ class HopShotClient:
         self.max_ping_ms = int(cfg.get("max_ping_ms", 15000) or 15000)
         self.nuclear_fail_fanout = cfg.get("nuclear_fail_fanout", True)
         self.reactive_probe_enabled = cfg.get("reactive_probe", self.max_ping_ms <= 5000)
+        self.startup_capacity_scan = cfg.get("startup_capacity_scan", True)
+        self.scan_throttle_threshold_pct = float(cfg.get("scan_throttle_threshold_pct", 80.0))
+        self.scan_recovery_threshold_pct = float(cfg.get("scan_recovery_threshold_pct", 20.0))
 
         if self.adaptive_mode:
             self.disable_hop = False
@@ -408,6 +411,54 @@ class HopShotClient:
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
+    def _pick_recovery_probe_port(self) -> int | None:
+        if self.port_max <= self.port_min:
+            return None
+        slot = common.time_slot_randomized(1000, self.seed, 17, self.clock_offset_ms)
+        candidate = common.deterministic_port(self.seed, slot + 7, self.port_min, self.port_max)
+        if candidate == self.server_port:
+            candidate = self.port_min if self.server_port != self.port_min else min(self.port_max, self.port_min + 1)
+        return candidate
+
+    def _startup_auto_scan(self, initial_probe: dict) -> tuple[float, dict]:
+        scan = {
+            "udp_throttled": False,
+            "udp_port_hopping_bypassed": False,
+            "initial_loss_pct": float(initial_probe.get("loss_pct", 100.0)),
+            "recovery_loss_pct": None,
+            "recovery_port": None,
+        }
+        initial_loss = scan["initial_loss_pct"]
+        if not self.startup_capacity_scan:
+            return initial_loss, scan
+
+        if initial_loss <= self.scan_throttle_threshold_pct:
+            return initial_loss, scan
+
+        scan["udp_throttled"] = True
+        recovery_port = self._pick_recovery_probe_port()
+        if recovery_port is None:
+            return initial_loss, scan
+
+        scan["recovery_port"] = recovery_port
+        recovery = probe_port(
+            self.primary_ip,
+            recovery_port,
+            count=max(5, int(self.cfg.get("probe_count", 20) / 2)),
+            timeout_ms=min(self.cfg.get("probe_timeout_ms", 2000), self.max_ping_ms),
+            seed=self.seed,
+            obfs=self.obfs,
+            resume_store=self._resume_store,
+            verbose=self.verbose,
+        )
+        recovery_loss = float(recovery.get("loss_pct", 100.0))
+        scan["recovery_loss_pct"] = recovery_loss
+
+        if recovery.get("received", 0) > 0 and recovery_loss < self.scan_recovery_threshold_pct:
+            scan["udp_port_hopping_bypassed"] = True
+            return recovery_loss, scan
+        return initial_loss, scan
+
     def start(self):
         self._running = True
         if self.verbose:
@@ -430,6 +481,23 @@ class HopShotClient:
         if self.verbose:
             log.debug(f"[client] clock offset={self.clock_offset_ms}ms")
 
+        effective_loss = result["loss_pct"]
+        if self.adaptive_mode:
+            effective_loss, scan = self._startup_auto_scan(result)
+            if scan["udp_throttled"]:
+                log.warning(
+                    f"[scan] startup UDP throttling detected loss={scan['initial_loss_pct']:.1f}% "
+                    f"threshold={self.scan_throttle_threshold_pct:.1f}%"
+                )
+                if scan["udp_port_hopping_bypassed"]:
+                    log.info(
+                        f"[scan] port-hopping bypass succeeded on port={scan['recovery_port']} "
+                        f"loss={scan['recovery_loss_pct']:.1f}%"
+                    )
+                else:
+                    log.warning("[scan] no stable recovery detected on alternate port")
+            self._record_metric("startup_scan", **scan)
+
         # If multiple destinations, pick the best one
         if len(self.dest_ips) > 1:
             self.primary_ip = self.resolver.best_destination(
@@ -439,7 +507,7 @@ class HopShotClient:
             log.info(f"[client] primary IP selected: {self.primary_ip}")
 
         # Phase 2: classify mode
-        self._set_mode(result["loss_pct"])
+        self._set_mode(effective_loss)
 
         # Phase 3: MTU probe (KCP-style) — determine safe shard size
         if self._mtu == 0:
@@ -1050,6 +1118,14 @@ Examples:
                    help="Enable loss-based adaptive hop/burst mode (default)")
     p.add_argument("--no-adaptive-mode", dest="adaptive_mode", action="store_false",
                    help="Disable adaptive mode and allow manual hop/burst overrides")
+    p.add_argument("--startup-capacity-scan", dest="startup_capacity_scan", action="store_true", default=True,
+                   help="At startup: detect UDP throttling then test recovery on another port")
+    p.add_argument("--no-startup-capacity-scan", dest="startup_capacity_scan", action="store_false",
+                   help="Disable startup throttling/recovery scan")
+    p.add_argument("--scan-throttle-pct", type=float, default=80.0,
+                   help="Startup scan threshold to flag UDP throttling")
+    p.add_argument("--scan-recovery-pct", type=float, default=20.0,
+                   help="Startup scan threshold to accept port-hopping recovery")
     p.add_argument("--max-ping-ms", type=int, default=15000,
                    help="Maximum tolerated RTT/latency in ms for connection-oriented paths")
     p.add_argument("--keepalive-sec",   type=int, default=15,
@@ -1115,6 +1191,9 @@ Examples:
         "disable_hop":       args.disable_hop,
         "manual_burst_mult": args.manual_burst,
         "adaptive_mode":     args.adaptive_mode,
+        "startup_capacity_scan": args.startup_capacity_scan,
+        "scan_throttle_threshold_pct": args.scan_throttle_pct,
+        "scan_recovery_threshold_pct": args.scan_recovery_pct,
         "max_ping_ms":       args.max_ping_ms,
         "keepalive_interval_sec": args.keepalive_sec,
         "tunnel_mode":       args.tunnel_mode,

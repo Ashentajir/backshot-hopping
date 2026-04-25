@@ -120,6 +120,7 @@ class HopShotServer:
 
         # Raw UDP socket
         self.udp_sock = None
+        self.extra_udp_socks = []
 
         # QUIC server
         self.quic_srv = None
@@ -162,6 +163,7 @@ class HopShotServer:
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.udp_sock.bind(("0.0.0.0", self.listen_port))
         log.info(f"Raw UDP listening on :{self.listen_port}")
+        self._bind_additional_udp_ports_if_needed()
 
         # QUIC (TLS 1.3)
         try:
@@ -183,6 +185,12 @@ class HopShotServer:
 
         # Threads
         threading.Thread(target=self._udp_loop,     daemon=True).start()
+        for idx, extra_sock in enumerate(self.extra_udp_socks):
+            threading.Thread(
+                target=self._udp_loop_on_socket,
+                args=(extra_sock, f"extra-{idx}"),
+                daemon=True,
+            ).start()
         threading.Thread(target=self._cleanup_loop,  daemon=True).start()
         if self._tunnel is not None:
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
@@ -191,25 +199,69 @@ class HopShotServer:
 
     # ── UDP receive loop ──────────────────────────────────────────────────────
 
+    def _bind_additional_udp_ports_if_needed(self):
+        if self.cfg.get("setup_iptables", False):
+            return
+
+        auto_bind = self.cfg.get("auto_bind_port_range", True)
+        if not auto_bind:
+            if self.port_min != self.listen_port or self.port_max != self.listen_port:
+                log.warning(
+                    "[compat] auto_bind_port_range disabled and no iptables redirect; "
+                    "hopping/range probes may fail unless upstream NAT forwards the full port range"
+                )
+            return
+
+        span = self.port_max - self.port_min + 1
+        max_bind = int(self.cfg.get("auto_bind_port_range_max", 128) or 128)
+        if span <= 1:
+            return
+        if span > max_bind:
+            log.warning(
+                f"[compat] port range span={span} too large for direct bind limit={max_bind}; "
+                "configure setup_iptables=true or narrow the port range"
+            )
+            return
+
+        for port in range(self.port_min, self.port_max + 1):
+            if port == self.listen_port:
+                continue
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                s.bind(("0.0.0.0", port))
+                self.extra_udp_socks.append(s)
+            except Exception as e:
+                log.warning(f"[compat] unable to bind extra UDP port {port}: {e}")
+
+        if self.extra_udp_socks:
+            log.info(
+                f"[compat] bound {len(self.extra_udp_socks)} extra UDP ports "
+                f"for direct range handling ({self.port_min}-{self.port_max})"
+            )
+
     def _udp_loop(self):
+        self._udp_loop_on_socket(self.udp_sock, "primary")
+
+    def _udp_loop_on_socket(self, recv_sock: socket.socket, label: str):
         buf = bytearray(common.MAX_PACKET + 64)
         while self._running:
             try:
-                n, addr = self.udp_sock.recvfrom_into(buf)
+                n, addr = recv_sock.recvfrom_into(buf)
                 pkt = bytes(buf[:n])
                 if self.verbose:
-                    log.debug(f"[UDP] rx {n}B from {addr}")
+                    log.debug(f"[UDP:{label}] rx {n}B from {addr}")
                 threading.Thread(
                     target=self._handle_udp,
-                    args=(pkt, addr),
+                    args=(pkt, addr, recv_sock),
                     daemon=True,
                 ).start()
             except Exception as e:
                 if self._running:
                     if self.verbose:
-                        log.exception(f"[UDP] receive loop: {e}")
+                        log.exception(f"[UDP:{label}] receive loop: {e}")
 
-    def _handle_udp(self, pkt: bytes, addr):
+    def _handle_udp(self, pkt: bytes, addr, recv_sock: socket.socket):
         # ── HTTP/3 masquerade unwrap ──────────────────────────────────────────
         if self.masquerade and HTTP3Masq.is_masqueraded(pkt):
             if self.verbose:
@@ -239,12 +291,12 @@ class HopShotServer:
                 f"shard={hdr['shard_idx']}/{hdr['total_shards']} transport={hdr['transport']}"
             )
         if t == common.TYPE_PROBE:
-            self._handle_probe(hdr, addr, common.TRANSPORT_RAW)
+            self._handle_probe(hdr, addr, common.TRANSPORT_RAW, tx_sock=recv_sock)
         elif t == common.TYPE_DATA:
-            self._handle_data(hdr, payload, addr, common.TRANSPORT_RAW)
+            self._handle_data(hdr, payload, addr, common.TRANSPORT_RAW, tx_sock=recv_sock)
         elif t == common.TYPE_MTU_PROBE:
             # MTU probe: echo back with the size we actually received
-            self._handle_mtu_probe(hdr, payload, addr, len(pkt))
+            self._handle_mtu_probe(hdr, payload, addr, len(pkt), tx_sock=recv_sock)
         elif t == common.TYPE_KEEPALIVE:
             self._handle_keepalive(hdr, addr)
 
@@ -272,7 +324,8 @@ class HopShotServer:
 
     # ── Probe handler ─────────────────────────────────────────────────────────
 
-    def _handle_probe(self, hdr: dict, addr, transport: int):
+    def _handle_probe(self, hdr: dict, addr, transport: int, tx_sock: socket.socket | None = None):
+        tx_sock = tx_sock or self.udp_sock
         reply = common.pack_header(
             pkt_type   = common.TYPE_PROBE_REPLY,
             seq        = hdr["seq"],
@@ -292,7 +345,7 @@ class HopShotServer:
         if self.obfs:
             reply = common.salamander(reply, self.seed)
         try:
-            self.udp_sock.sendto(reply, addr)
+            tx_sock.sendto(reply, addr)
         except Exception:
             pass
         if self.verbose:
@@ -353,56 +406,8 @@ class HopShotServer:
                 if self._running and self.verbose:
                     log.exception(f"[tunnel] tx loop: {e}")
 
-    def _send_tunnel_payload(self, payload: bytes, sess: Session):
-        if sess.addr is None:
-            return
-
-        with self._tun_seq_lock:
-            self._tun_seq = (self._tun_seq + 1) & 0xFFFFFFFF
-            seq = self._tun_seq
-
-        encoded = encode_datagrams(
-            payload=payload,
-            seq=seq,
-            session_id=sess.session_id,
-            seed=self.seed,
-            fec_k=self.fec_k,
-            fec_m=self.fec_m,
-            jitter=self.jitter,
-            obfs=self.obfs,
-            masquerade=self.masquerade,
-            transport=common.TRANSPORT_RAW,
-        )
-
-        for pkt in encoded.datagrams:
-            try:
-                self.udp_sock.sendto(pkt, sess.addr)
-            except Exception:
-                if self.verbose:
-                    log.exception(f"[tunnel] send failed sess={sess.session_id} addr={sess.addr}")
-
-    def _tunnel_tx_loop(self):
-        if self._tunnel is None:
-            return
-
-        while self._running:
-            try:
-                pkt = self._tunnel.read(65535)
-                if not pkt:
-                    continue
-                with self.sess_lock:
-                    sessions = list(self.sessions.values())
-                    if self._tunnel_session_id is not None and self._tunnel_session_id in self.sessions:
-                        sessions = [self.sessions[self._tunnel_session_id]]
-                target = next((sess for sess in sessions if sess.addr is not None), None)
-                if target is None:
-                    continue
-                self._send_tunnel_payload(pkt, target)
-            except Exception as e:
-                if self._running and self.verbose:
-                    log.exception(f"[tunnel] tx loop: {e}")
-
-    def _handle_mtu_probe(self, hdr: dict, payload: bytes, addr, recv_size: int):
+    def _handle_mtu_probe(self, hdr: dict, payload: bytes, addr, recv_size: int, tx_sock: socket.socket | None = None):
+        tx_sock = tx_sock or self.udp_sock
         """Echo back an MTU_REPLY carrying the received size."""
         reply_hdr = common.pack_header(
             pkt_type   = common.TYPE_MTU_REPLY,
@@ -417,7 +422,7 @@ class HopShotServer:
         if self.obfs:
             reply = common.salamander(reply, self.seed)
         try:
-            self.udp_sock.sendto(reply, addr)
+            tx_sock.sendto(reply, addr)
         except Exception:
             pass
         if self.verbose:
@@ -425,7 +430,7 @@ class HopShotServer:
 
     # ── Data handler ──────────────────────────────────────────────────────────
 
-    def _handle_data(self, hdr: dict, payload: bytes, addr, transport: int):
+    def _handle_data(self, hdr: dict, payload: bytes, addr, transport: int, tx_sock: socket.socket | None = None):
         if len(payload) < 4:
             if self.verbose:
                 log.debug(f"[DATA] short payload seq={hdr['seq']} len={len(payload)}")
@@ -487,13 +492,14 @@ class HopShotServer:
                         f"✓ [{stack}] delivered {len(recovered)} bytes "
                         f"seq={seq} shards={grp.received}/{total}"
                     )
-                    self._on_payload(sid, recovered, addr, transport, sess)
+                    self._on_payload(sid, recovered, addr, transport, sess, tx_sock=tx_sock)
                 except Exception as e:
                     if self.verbose:
                         log.exception(f"[DATA] FEC reconstruct seq={seq}: {e}")
 
-    def _on_payload(self, sid, data: bytes, addr, transport, sess: Session):
+    def _on_payload(self, sid, data: bytes, addr, transport, sess: Session, tx_sock: socket.socket | None = None):
         """Application delivery point — prints received payload."""
+        tx_sock = tx_sock or self.udp_sock
         if self._tunnel is not None:
             try:
                 self._tunnel.write(data)
@@ -520,7 +526,7 @@ class HopShotServer:
             if self.obfs:
                 pkt = common.salamander(pkt, self.seed)
             try:
-                self.udp_sock.sendto(pkt, addr)
+                tx_sock.sendto(pkt, addr)
             except Exception:
                 pass
             log.info(
@@ -648,6 +654,12 @@ class HopShotServer:
             self.udp_sock.close()
         except Exception:
             pass
+        for s in self.extra_udp_socks:
+            try:
+                s.close()
+            except Exception:
+                pass
+        self.extra_udp_socks = []
         if self.quic_srv:
             self.quic_srv.stop()
         if self._tunnel:

@@ -131,20 +131,80 @@ python server.py --diagnose
 
 ### Deployment on server
 
-1. Copy the repository to the server host.
-2. Run `python deploy.py server`.
-3. Edit `server.config.json` if you want to change ports, seed, or logging.
-4. Open the UDP ports you plan to use, including the QUIC/TLS port if enabled.
-5. Rerun the same command to start the server with the saved settings.
+This is the recommended server flow (validated with `deploy.py server --prepare-only` and `deploy.py server --diagnose`).
 
-Example:
+1. Copy the repository to the server host and enter the folder.
+2. Run a safe bootstrap first:
+
+```bash
+python deploy.py server --prepare-only
+```
+
+3. Generate a fresh shared seed and apply it to both local configs:
+
+```bash
+python deploy.py genkey
+```
+
+4. Edit `server.config.json` for your environment.
+: Minimum fields to check: `listen_port`, `quic_port`, `port_min`, `port_max`, `shared_seed`, `max_ping_ms`, `log_file`.
+
+5. Validate resolved server config before launching:
+
+```bash
+python deploy.py server --diagnose
+```
+
+6. Open firewall/NAT for UDP listener ports.
+: At minimum open `listen_port` and your hop range (`port_min`..`port_max`).
+: If QUIC is enabled in your deployment, open `quic_port` too.
+
+7. Start the server:
+
+```bash
+python deploy.py server
+```
+
+8. Verify runtime:
+: Confirm startup logs show listener ports and transport options.
+: Check `server.log` (or your configured log file) for incoming probes/data.
+
+Note: if startup logs show a QUIC init warning and continue in raw UDP mode, ensure OpenSSL is installed and available in PATH so certificate generation can succeed.
+
+If the server is behind NAT or cloud security groups, make sure those rules forward/allow the same UDP ports to the host running `server.py`.
+
+#### Linux service example (systemd)
+
+```ini
+[Unit]
+Description=HopShot Server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hopshot
+ExecStart=/usr/bin/python3 /opt/hopshot/deploy.py server --config /opt/hopshot/server.config.json
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Then enable it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now hopshot
+sudo systemctl status hopshot
+```
+
+#### Manual run example
 
 ```bash
 python server.py --port 10000 --quic-port 10001 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --iptables --masquerade
+  --port-min 10000 --port-max 65000 --max-ping-ms 15000 --masquerade
 ```
-
-If you are running behind a firewall or NAT, make sure the listener ports are forwarded to the machine running `server.py`.
 
 ### Deployment on client
 

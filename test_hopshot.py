@@ -34,7 +34,7 @@ def test(name, fn):
 # ── Mini server helper ────────────────────────────────────────────────────────
 
 def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
-                probe_token=None, drop_every=0):
+                probe_token=None, drop_every=0, loss_pct=0):
     """Returns (run_obj, received_list). run_obj.alive=False to stop."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -43,13 +43,26 @@ def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
     received = []
     groups   = {}
     data_seen = 0
+    pkt_seen = 0
     fec_k = fec_m = 4
 
+    def should_drop(pkt_idx: int) -> bool:
+        if drop_every and pkt_idx % drop_every == 0:
+            return True
+        if loss_pct <= 0:
+            return False
+        # Deterministic spread (non-random) so tests are stable while still
+        # matching the requested loss percentage up to 98%.
+        return ((pkt_idx * loss_pct) % 100) < loss_pct
+
     def run():
-        nonlocal data_seen
+        nonlocal data_seen, pkt_seen
         while getattr(run, "alive", True):
             try:
                 data, addr = sock.recvfrom(2048)
+                pkt_seen += 1
+                if should_drop(pkt_seen):
+                    continue
                 if obfs:
                     data = common.salamander(data, seed)
                 hdr, payload = common.unpack_header(data)
@@ -63,8 +76,6 @@ def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
                     sock.sendto(rep, addr)
                 elif hdr["type"] == common.TYPE_DATA:
                     data_seen += 1
-                    if drop_every and data_seen % drop_every == 0:
-                        continue
                     orig_len   = struct.unpack_from("!I", payload)[0]
                     shard_data = common.strip_jitter_padding(payload[4:], jitter)
                     seq, idx, total = hdr["seq"], hdr["shard_idx"], hdr["total_shards"]
@@ -411,6 +422,35 @@ def t_multi_dest():
     assert rx1[0] == msg
 test("burst sender delivers to primary destination", t_multi_dest)
 
+def t_hop_burst_uses_multiple_ports():
+    cfg = base_cfg(
+        19830,
+        adaptive_mode=False,
+        disable_hop=False,
+        fixed_hop_ms=0,
+        port_min=19830,
+        port_max=19880,
+    )
+    c = HopShotClient(cfg)
+    try:
+        c.mode = common.MODE_HIGH
+        c.hop_ms, c.burst_mult = common.MODE_PARAMS[common.MODE_HIGH]
+        ports = {
+            c._select_dst_port(
+                seq=11,
+                shard_idx=0,
+                burst_idx=i,
+                hop_ms=c.hop_ms,
+                burst_mult=c.burst_mult,
+                force_multi_port=False,
+            )
+            for i in range(c.burst_mult)
+        }
+        assert len(ports) > 1, f"expected multi-port fanout, got {ports}"
+    finally:
+        c.stop()
+test("hopping burst uses multiple destination ports", t_hop_burst_uses_multiple_ports)
+
 # ── 10. Source port randomization (optional) ─────────────────────────────────
 print("\n[ Source Port Randomization (optional) ]")
 
@@ -654,6 +694,47 @@ def t_e2e_nuclear():
     assert rx and rx[0]==msg
 test("NUCLEAR mode: 8x burst, data delivered", t_e2e_nuclear)
 
+def t_loss_sweep_reachability_to_98pct():
+    # Increasing loss ladder to represent progressively worse links.
+    loss_ladder = [0, 30, 50, 70, 85, 90, 95, 98]
+    probe_received = []
+
+    for loss in loss_ladder:
+        port = 19860 + random.randint(0, 60)
+        srv, rx = mini_server(port, jitter=0, loss_pct=loss)
+        time.sleep(0.05)
+
+        # Reachability check under increasing loss.
+        probe = probe_port("127.0.0.1", port, count=160, timeout_ms=6000, seed=b"test-seed")
+        probe_received.append(probe["received"])
+        assert probe["received"] > 0, f"no probe replies at {loss}% loss"
+
+        # Data-path check with strongest profile-like behavior.
+        c = HopShotClient(base_cfg(port, jitter_bytes=0, adaptive_mode=False, disable_hop=True))
+        c.mode = common.MODE_NUCLEAR
+        c.hop_ms, c.burst_mult = common.MODE_PARAMS[common.MODE_NUCLEAR]
+        c._running = True
+        c.quic_ok = False
+
+        for i in range(10):
+            c.send(f"loss={loss} msg={i}".encode())
+
+        time.sleep(1.5)
+        c.stop()
+        srv.alive = False
+
+        # At extreme 98% loss we only require server reachability; delivery may
+        # be intermittent depending on strict drop pattern.
+        if loss < 98:
+            assert rx, f"no data reconstructed at {loss}% loss"
+
+    # Probe success should trend downward as loss increases.
+    for i in range(1, len(probe_received)):
+        assert probe_received[i] <= probe_received[i - 1], (
+            f"probe reachability not decreasing: {probe_received}"
+        )
+test("loss sweep 0%..98% keeps reachability on strict bad network", t_loss_sweep_reachability_to_98pct)
+
 def t_adaptive_mode_forces_auto_hop_burst():
     cfg = base_cfg(19790, adaptive_mode=True, disable_hop=True, fixed_hop_ms=2500, manual_burst_mult=9)
     c = HopShotClient(cfg)
@@ -717,6 +798,46 @@ def t_max_ping_propagates_to_quic_timeout():
             c.stop()
         clientmod.QUICClient = original_quic
 test("max_ping_ms is honored by QUIC connect timeout", t_max_ping_propagates_to_quic_timeout)
+
+def t_startup_scan_port_hopping_recovery_logic():
+    original_probe = clientmod.probe_port
+    calls = []
+
+    def fake_probe(server_ip, port, count=20, timeout_ms=2000,
+                   seed=b"hopshot", obfs=False, resume_store=None, verbose=False):
+        calls.append(port)
+        if len(calls) == 1:
+            return {
+                "port": port,
+                "loss_pct": 9.0,
+                "rtt_ms": 130.0,
+                "sent": count,
+                "received": max(1, int(count * 0.9)),
+                "clock_offset_ms": 0,
+            }
+        return {
+            "port": port,
+            "loss_pct": 92.0,
+            "rtt_ms": 120.0,
+            "sent": count,
+            "received": 1,
+            "clock_offset_ms": 0,
+        }
+
+    c = None
+    clientmod.probe_port = fake_probe
+    try:
+        c = HopShotClient(base_cfg(19890, port_min=19890, port_max=19940, adaptive_mode=True))
+        effective_loss, scan = c._startup_auto_scan({"loss_pct": 92.0, "received": 1})
+        assert scan["udp_throttled"] is True
+        assert scan["udp_port_hopping_bypassed"] is True
+        assert effective_loss < 20.0
+        assert scan["recovery_port"] is not None
+    finally:
+        if c is not None:
+            c.stop()
+        clientmod.probe_port = original_probe
+test("startup scan mirrors throttling then port-hopping recovery logic", t_startup_scan_port_hopping_recovery_logic)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 print("\n" + "="*50)
