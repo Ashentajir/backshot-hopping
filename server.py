@@ -36,7 +36,7 @@ import brutal
 from quic_transport import QUICServer, generate_selfsigned_cert
 from http3_masq import HTTP3Masq
 from session_resume import SessionTokenManager
-from terminal_ui import configure_logging, colorize, title
+from terminal_ui import configure_logging, key_value, section_header, supports_color, title
 from version import __version__
 
 logging.basicConfig(
@@ -560,9 +560,19 @@ def main():
 
     configure_logging(args.verbose, log_file=cfg.get("log_file"), json_logs=cfg.get("json_logs", False))
 
-    print(title(f"HopShot Server v{__version__}", "cyan"))
-    print(colorize(f"listen: {cfg['listen_port']}  quic: {cfg['quic_port']}", "green", bold=True))
-    print(colorize(f"mode: obfs={cfg['obfs']} masq={cfg['masquerade']} jitter={cfg['jitter_bytes']}", "blue"))
+    use_color = supports_color()
+    print("\n".join([
+        title(f"HopShot Server v{__version__}", "cyan", use_color=use_color),
+        section_header("Listener", "cyan", use_color=use_color),
+        key_value("listen", f"{cfg['listen_port']}", value_color="green", use_color=use_color),
+        key_value("quic", f"{cfg['quic_port']}", value_color="blue", use_color=use_color),
+        key_value("port-range", f"{cfg['port_min']}-{cfg['port_max']}", value_color="cyan", use_color=use_color),
+        "",
+        section_header("Transport", "blue", use_color=use_color),
+        key_value("obfs", "on" if cfg["obfs"] else "off", value_color="green" if cfg["obfs"] else "yellow", use_color=use_color),
+        key_value("masquerade", "on" if cfg["masquerade"] else "off", value_color="green" if cfg["masquerade"] else "yellow", use_color=use_color),
+        key_value("jitter", f"{cfg['jitter_bytes']}B", value_color="magenta", use_color=use_color),
+    ]))
 
     if args.diagnose:
         print(json.dumps(cfg, indent=2, sort_keys=True))

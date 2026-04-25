@@ -42,7 +42,10 @@ def supports_color(stream=None) -> bool:
         return False
 
 
-def colorize(text: str, color_name: str, bold: bool = False, dim: bool = False) -> str:
+def colorize(text: str, color_name: str = "", bold: bool = False, dim: bool = False,
+             use_color: bool = True) -> str:
+    if not use_color:
+        return text
     prefix = ""
     if bold:
         prefix += BOLD
@@ -54,8 +57,21 @@ def colorize(text: str, color_name: str, bold: bool = False, dim: bool = False) 
     return f"{prefix}{text}{RESET}"
 
 
-def title(text: str, color_name: str = "cyan") -> str:
-    return colorize(text, color_name, bold=True)
+def title(text: str, color_name: str = "cyan", use_color: bool = True) -> str:
+    return colorize(text, color_name, bold=True, use_color=use_color)
+
+
+def section_header(text: str, color_name: str = "cyan", use_color: bool = True) -> str:
+    return colorize(f"[ {text} ]", color_name, bold=True, use_color=use_color)
+
+
+def key_value(key: str, value, key_color: str = "cyan", value_color: str = None,
+              use_color: bool = True, width: int = 18) -> str:
+    key_text = colorize(f"{key:<{width}}", key_color, bold=True, use_color=use_color)
+    value_text = str(value)
+    if value_color:
+        value_text = colorize(value_text, value_color, bold=True, use_color=use_color)
+    return f"{key_text} {value_text}"
 
 
 class ColorFormatter(logging.Formatter):
@@ -65,7 +81,7 @@ class ColorFormatter(logging.Formatter):
 
     def format(self, record: logging.LogRecord) -> str:
         timestamp = self.formatTime(record, "%H:%M:%S")
-        level = record.levelname
+        level = f"{record.levelname:<8}"
         name = record.name
         message = record.getMessage()
         if record.exc_info:
@@ -73,7 +89,8 @@ class ColorFormatter(logging.Formatter):
 
         if self.use_color and record.levelno in LEVEL_COLORS:
             level = f"{LEVEL_COLORS[record.levelno]}{level}{RESET}"
-            name = colorize(name, "blue", bold=True)
+            name = colorize(name, "blue", bold=True, use_color=True)
+            timestamp = colorize(timestamp, "white", dim=True, use_color=True)
         return f"{timestamp} [{level}] {name}: {message}"
 
 

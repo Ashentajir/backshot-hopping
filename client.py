@@ -44,7 +44,7 @@ from resolver import Resolver, DEFAULT_RESOLVERS
 from http3_masq import HTTP3Masq
 from mtu_probe import MTUProber
 from session_resume import ResumeTokenStore, TOKEN_SIZE
-from terminal_ui import configure_logging, colorize, title
+from terminal_ui import configure_logging, colorize, key_value, section_header, supports_color, title
 from version import __version__
 
 logging.basicConfig(
@@ -94,15 +94,29 @@ def apply_profile_overrides(cfg: dict) -> dict:
 
 
 def render_config_summary(cfg: dict) -> str:
+    use_color = supports_color()
+    destinations = cfg.get("destinations", [])
+    hop_state = "off" if cfg.get("disable_hop", False) else "on"
+    obfs_state = "on" if cfg["obfs"] else "off"
+    masq_state = "on" if cfg["masquerade"] else "off"
+    rand_src_state = "on" if cfg["rand_src_port"] else "off"
     lines = [
-        title(f"HopShot Client v{__version__}", "cyan"),
-        f"profile: {colorize(cfg['profile'], 'green', bold=True)}",
-        f"server: {cfg['server_port']}  quic: {cfg['quic_port']}  dests: {len(cfg['destinations'])}",
-        f"port-range: {cfg['port_min']}-{cfg['port_max']}  hop-disabled: {cfg.get('disable_hop', False)}",
-        f"obfs: {cfg['obfs']}  masquerade: {cfg['masquerade']}  rand-src: {cfg['rand_src_port']}",
-        f"jitter: {cfg['jitter_bytes']}B  preemptive-hop: {cfg['preemptive_hop_ms']}ms",
-        f"fec: {cfg['fec_k']}x{cfg['fec_m']}  declared-up: {cfg['declared_up_kbps']}kbps",
-        f"log-file: {cfg.get('log_file') or '-'}  metrics-file: {cfg.get('metrics_file') or '-'}",
+        title(f"HopShot Client v{__version__}", "cyan", use_color=use_color),
+        section_header("Session", "cyan", use_color=use_color),
+        key_value("profile", cfg["profile"], value_color="green", use_color=use_color),
+        key_value("server", f"{cfg['server_port']} / {cfg['quic_port']}  dests={len(destinations)}", value_color="blue", use_color=use_color),
+        key_value("ports", f"{cfg['port_min']}-{cfg['port_max']}  hop={hop_state}", value_color="yellow" if hop_state == "off" else "green", use_color=use_color),
+        "",
+        section_header("Transport", "blue", use_color=use_color),
+        key_value("obfs", obfs_state, value_color="green" if cfg["obfs"] else "yellow", use_color=use_color),
+        key_value("masquerade", masq_state, value_color="green" if cfg["masquerade"] else "yellow", use_color=use_color),
+        key_value("rand-src", rand_src_state, value_color="green" if cfg["rand_src_port"] else "yellow", use_color=use_color),
+        key_value("jitter", f"{cfg['jitter_bytes']}B  preemptive={cfg['preemptive_hop_ms']}ms", value_color="cyan", use_color=use_color),
+        key_value("fec / up", f"{cfg['fec_k']}x{cfg['fec_m']}  declared={cfg['declared_up_kbps']}kbps", value_color="magenta", use_color=use_color),
+        "",
+        section_header("Logs", "magenta", use_color=use_color),
+        key_value("log-file", cfg.get("log_file") or "-", value_color="white", use_color=use_color),
+        key_value("metrics-file", cfg.get("metrics_file") or "-", value_color="white", use_color=use_color),
     ]
     return "\n".join(lines)
 
@@ -853,10 +867,11 @@ Examples:
         print(render_config_summary(cfg))
         return
 
-    print(title(f"HopShot Client v{__version__}", "cyan"))
-    print(colorize(f"profile: {cfg['profile']}", "green", bold=True))
+    use_color = supports_color()
+
+    print(render_config_summary(cfg))
     if cfg.get("disable_hop"):
-        print(colorize("hop routing disabled by profile", "yellow", bold=True))
+        print(colorize("hop routing disabled by profile", "yellow", bold=True, use_color=use_color))
 
     # ── Start ──────────────────────────────────────────────────────────────────
     client = HopShotClient(cfg)
