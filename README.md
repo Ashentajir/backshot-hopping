@@ -86,10 +86,6 @@ If you prefer a domain name instead of an IP, set `--server` to the domain or pu
 
 ### Release CLI
 
-Use these commands to inspect the release build:
-
-```bash
-python client.py --version
 python server.py --version
 python client.py --diagnose --server 127.0.0.1 --dest 127.0.0.1
 python server.py --diagnose
@@ -136,34 +132,12 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 
 ### Project layout
 
-- `deploy.py` - self-installing bootstrapper for server/client
-- `server.config.example.json` - starter server settings
-- `client.config.example.json` - starter client settings
-- `requirements.txt` - install list used by the bootstrapper
 - `client.py` - client CLI and transport pipeline
 - `server.py` - server CLI and receive pipeline
 - `common.py` - packet headers, hopping, and shared helpers
-- `fec.py` - FEC and recovery logic
-- `brutal.py` - Brutal CC pacing and feedback
-- `http3_masq.py` - HTTP/3 camouflage helpers
-- `mtu_probe.py` - MTU discovery
-- `resolver.py` - DNS and destination probing
-- `session_resume.py` - probe token cache
-- `terminal_ui.py` - colored logging and terminal formatting
-- `test_hopshot.py` - integration test suite
-
-### Notes
-
-- The transport is designed for experimentation and controlled deployments.
-- The client and server should use the same shared seed.
-- If you enable masquerading or iptables redirect, make sure the server side is configured for it.
-
 ## فارسی
 
 ### این پروژه چه کاری انجام می‌دهد
-
-HopShot یک نمونهٔ پایتونی برای تونل UDP با پرش تطبیقی پورت، FEC، نویز دادن به اندازهٔ بسته‌ها، ماسک‌کردن اختیاری HTTP/3، و CLI آمادهٔ استفاده برای کلاینت و سرور است.
-
 ### ویژگی‌ها
 
 - پرش تطبیقی پورت
