@@ -572,10 +572,10 @@ class HopShotServer:
                     log.debug(f"[session] created sid={sid} addr={addr}")
                 if self.tunnel_mode != "off" and self._tunnel_session_id is None:
                     self._tunnel_session_id = sid
-            elif addr and self.sessions[sid].addr is None:
+            elif addr and self.sessions[sid].addr != addr:
                 self.sessions[sid].addr = addr
                 if self.verbose:
-                    log.debug(f"[session] bound sid={sid} addr={addr}")
+                    log.debug(f"[session] updated sid={sid} new_addr={addr}")
                 if self.tunnel_mode != "off" and self._tunnel_session_id is None:
                     self._tunnel_session_id = sid
             return self.sessions[sid]

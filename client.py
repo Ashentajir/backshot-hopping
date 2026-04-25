@@ -208,7 +208,7 @@ def probe_port(server_ip, port, count=20, timeout_ms=2000,
             pass
         time.sleep(interval)
 
-    time.sleep(min(0.5, timeout_ms / 2000.0))
+    time.sleep(min(1.5, timeout_ms / 1000.0))
     stop_ev.set()
     sock.close()
 
