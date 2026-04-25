@@ -1,0 +1,17 @@
+{
+  "listen_port": 10000,
+  "quic_port": 10001,
+  "port_min": 10000,
+  "port_max": 65000,
+  "shared_seed": "change-me",
+  "obfs": false,
+  "masquerade": false,
+  "setup_iptables": false,
+  "certfile": "hopshot.crt",
+  "keyfile": "hopshot.key",
+  "declared_down_kbps": 0,
+  "verbose": false,
+  "jitter_bytes": 64,
+  "log_file": "server.log",
+  "json_logs": false
+}
