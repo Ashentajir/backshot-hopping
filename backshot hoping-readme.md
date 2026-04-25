@@ -29,6 +29,7 @@ Zero external dependencies. Pure Python 3. Runs on Linux, macOS, Termux/Android.
   Selective ARQ — NACK only missing shards (KCP-style)
   Burst sender — each shard sent x N times across different ports
   Randomized hop — shared_seed + jittered_time_slot -> port (Hysteria2-style)
+  TUN/TAP bridge — raw packets read from a local interface and forwarded; Windows uses Wintun-backed TUN
   HTTP/3 masquerade — wrap in QUIC Initial + H3 DATA frame (optional)
   Salamander obfs — optional XOR-stream scrambling
   ════════ NETWORK ════════
@@ -83,15 +84,15 @@ fragmentation that destroys port-hop stealth.
 
 ### Server
 ```bash
-python3 server.py --port 10000 --seed "my-secret"
-sudo python3 server.py --port 10000 --seed "my-secret" \
+python3 server.py --port 10000 --seed "change-me"
+sudo python3 server.py --port 10000 --seed "change-me" \
     --masquerade --obfs --iptables --port-min 10000 --port-max 65000
 ```
 
 ### Client
 ```bash
 # Basic
-python3 client.py --server 1.2.3.4 --port 10000 --seed "my-secret"
+python3 client.py --server 1.2.3.4 --port 10000 --seed "change-me"
 
 # Declare uplink bandwidth (prevents ISP QoS)
 python3 client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
@@ -107,7 +108,7 @@ python3 client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 ```json
 {
   "server_port":      10000,
-  "shared_seed":      "my-secret",
+  "shared_seed":      "change-me",
   "masquerade":       true,
   "declared_up_kbps": 50000,
   "mtu":              0,
@@ -115,4 +116,5 @@ python3 client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
   "fec_m":            4
 }
 ```
+Use `python deploy.py genkey` to write a fresh random `shared_seed` into both local configs before deployment.
 known bug to be fixed :  prot probe token  is broken i know why im working on it  0-RTT is  not working in this version 

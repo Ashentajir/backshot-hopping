@@ -20,6 +20,7 @@ TYPE_BW_FEEDBACK = 0x04
 TYPE_BW_REPORT   = 0x05
 TYPE_MTU_PROBE   = 0x06
 TYPE_MTU_REPLY   = 0x07
+TYPE_KEEPALIVE   = 0x0A
 
 TRANSPORT_RAW  = 0x00
 TRANSPORT_QUIC = 0x01
@@ -70,7 +71,7 @@ def randomized_hop_interval(base_ms: int) -> int:
     delta = int(base_ms * HOP_JITTER_RATIO)
     return base_ms + random.randint(-delta, delta)
 
-def time_slot_randomized(base_ms: int, seed: bytes, seq: int) -> int:
+def time_slot_randomized(base_ms: int, seed: bytes, seq: int, clock_offset_ms: int = 0) -> int:
     """
     Compute a time slot using a randomized interval derived deterministically
     from (seed, seq). Both client and server agree on the same jitter because
@@ -79,7 +80,7 @@ def time_slot_randomized(base_ms: int, seed: bytes, seq: int) -> int:
     """
     if base_ms <= 0:
         return 0
-    now_ms = int(time.time() * 1000)
+    now_ms = int(time.time() * 1000) + clock_offset_ms
     base_slot = now_ms // base_ms
     # Deterministic jitter from seed+seq so both sides agree on the slot.
     mac = _hmac.new(seed, struct.pack("!qI", base_slot, seq),
@@ -147,10 +148,10 @@ def deterministic_port(seed: bytes, slot: int, port_min: int, port_max: int) -> 
     val = struct.unpack_from("!Q", mac)[0]
     return port_min + (val % spread)
 
-def time_slot(interval_ms: int) -> int:
+def time_slot(interval_ms: int, clock_offset_ms: int = 0) -> int:
     if interval_ms <= 0:
         return 0
-    return int(time.time() * 1000) // interval_ms
+    return (int(time.time() * 1000) + clock_offset_ms) // interval_ms
 
 # ─── Packet size jitter ───────────────────────────────────────────────────────
 

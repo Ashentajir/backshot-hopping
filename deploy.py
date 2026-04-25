@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,13 @@ SERVER_DEFAULT_CONFIG = {
     "declared_down_kbps": 0,
     "verbose": False,
     "jitter_bytes": 64,
+    "tunnel_mode": "off",
+    "tunnel_iface": "hopshot0",
+    "tunnel_mtu": 1400,
+    "tunnel_address": None,
+    "tunnel_peer": None,
+    "tunnel_route_default": False,
+    "keepalive_interval_sec": 15,
     "log_file": "server.log",
     "json_logs": False,
 }
@@ -46,6 +54,14 @@ CLIENT_DEFAULT_CONFIG = {
     "rand_src_port": False,
     "jitter_bytes": 64,
     "preemptive_hop_ms": 800,
+    "fixed_hop_ms": 0,
+    "keepalive_interval_sec": 15,
+    "tunnel_mode": "off",
+    "tunnel_iface": "hopshot0",
+    "tunnel_mtu": 1400,
+    "tunnel_address": None,
+    "tunnel_peer": None,
+    "tunnel_route_default": False,
     "declared_up_kbps": 0,
     "masquerade": False,
     "mtu": 0,
@@ -114,15 +130,49 @@ def ensure_config(role: str, config_path: Path) -> None:
     config_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
+def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_config(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def update_shared_seed(seed: str) -> tuple[Path, Path]:
+    server_path = ROOT / "server.config.json"
+    client_path = ROOT / "client.config.json"
+    ensure_config("server", server_path)
+    ensure_config("client", client_path)
+
+    server_cfg = load_config(server_path)
+    client_cfg = load_config(client_path)
+    server_cfg["shared_seed"] = seed
+    client_cfg["shared_seed"] = seed
+    write_config(server_path, server_cfg)
+    write_config(client_path, client_cfg)
+    return server_path, client_path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="HopShot deployment bootstrapper")
-    parser.add_argument("role", choices=("server", "client"), help="Which app to prepare and run")
+    parser.add_argument("role", choices=("server", "client", "genkey"), help="Which app to prepare and run")
     parser.add_argument("--config", default=None, help="Config file to create/use for the selected role")
     parser.add_argument("--prepare-only", action="store_true", help="Install and create config, but do not launch")
     args, extra = parser.parse_known_args()
 
     py = ensure_venv()
     install_dependencies(py)
+
+    if args.role == "genkey":
+        seed = secrets.token_hex(32)
+        server_path, client_path = update_shared_seed(seed)
+        print("Generated new shared seed.")
+        print(f"Seed: {seed}")
+        print(f"Updated: {server_path}")
+        print(f"Updated: {client_path}")
+        return 0
 
     config_path = Path(args.config) if args.config else ROOT / f"{args.role}.config.json"
     if not config_path.is_absolute():

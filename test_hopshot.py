@@ -12,6 +12,7 @@ from client import probe_port, HopShotClient, PROFILE_PRESETS, apply_profile_ove
 from http3_masq import HTTP3Masq
 from resolver import Resolver, _query_resolver, _build_dns_query, _parse_dns_response
 from session_resume import ResumeTokenStore, TOKEN_SIZE
+from tunnel_codec import DataReassembler, encode_datagrams
 from version import __version__
 
 PASS = "\033[92m✓\033[0m"
@@ -208,12 +209,14 @@ def t_profile_overrides():
         "preemptive_hop_ms": 999,
     }
     cfg = apply_profile_overrides(base)
-    assert cfg["disable_hop"] is True
+    assert cfg["disable_hop"] is False
     assert cfg["obfs"] is False
     assert cfg["masquerade"] is False
     assert cfg["rand_src_port"] is False
     assert cfg["jitter_bytes"] == 0
-    assert cfg["preemptive_hop_ms"] == 0
+    assert cfg["preemptive_hop_ms"] == 10000
+    assert cfg["fixed_hop_ms"] == 10000
+    assert cfg["keepalive_interval_sec"] == 20
     assert set(PROFILE_PRESETS) == {"balanced", "reliable", "stealth", "throughput"}
 test("profile presets map to safe operator modes", t_profile_overrides)
 
@@ -273,6 +276,8 @@ def t_time_slot_randomized_wallclock():
         common.time.monotonic = lambda: 98765.0
         second = common.time_slot_randomized(1000, b"seed", 7)
         assert first == second
+        shifted = common.time_slot_randomized(1000, b"seed", 7, clock_offset_ms=1000)
+        assert shifted != first
     finally:
         common.time.time = original_time
         common.time.monotonic = original_monotonic
@@ -447,6 +452,30 @@ def t_bad_magic():
     hdr,_=common.unpack_header(b"\x00"*16)
     assert hdr is None
 test("bad magic rejected", t_bad_magic)
+
+def t_tunnel_codec_roundtrip():
+    payload = b"hello tunnel"
+    encoded = encode_datagrams(
+        payload=payload,
+        seq=42,
+        session_id=7,
+        seed=b"seed",
+        fec_k=4,
+        fec_m=4,
+        jitter=0,
+        obfs=False,
+        masquerade=False,
+    )
+    assembler = DataReassembler(4, 4, 0)
+    recovered = None
+    for pkt in encoded.datagrams:
+        hdr, body = common.unpack_header(pkt)
+        assert hdr is not None
+        maybe = assembler.push(hdr, body)
+        if maybe is not None:
+            recovered = maybe
+    assert recovered == payload
+test("tunnel codec roundtrip", t_tunnel_codec_roundtrip)
 
 # ── 12. HTTP/3 masquerading ────────────────────────────────────────────────
 print("\n[ HTTP/3 Masquerade ]")

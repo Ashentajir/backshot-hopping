@@ -30,6 +30,18 @@ HopShot runs a client and a server that exchange UDP traffic through a configura
 - Optional admin/root privileges for firewall or port redirection setup
 - No domain is required. You can use a raw IP address or a hostname. A domain is only useful if you want a stable name that points to the server IP.
 
+### Termux / Android
+
+HopShot also runs in Termux with the standard Python package.
+
+```bash
+pkg update
+pkg install python git
+python deploy.py client
+```
+
+If you are connecting to a remote server, create both configs and then set the destination IP or hostname in `client.config.json`.
+
 ### Quick start
 
 ### One-command deployment
@@ -39,9 +51,12 @@ Use the deployment bootstrapper to install everything and create local config fi
 ```bash
 python deploy.py server
 python deploy.py client
+python deploy.py genkey
 ```
 
 The first run creates the virtual environment, installs the available packages, and generates `server.config.json` or `client.config.json` from the example files if they do not already exist. Edit `server.config.json` if you want to change server settings, then rerun the same command.
+
+`python deploy.py genkey` writes a fresh cryptographically random `shared_seed` into both local config files so you do not need to copy the example placeholder seed.
 
 For Windows users, there is also a simple menu launcher: `client-launch.bat`. It gives you a tiny text UI, writes `client.config.json`, and then starts the client through the bootstrapper.
 
@@ -80,9 +95,32 @@ If you prefer a domain name instead of an IP, set `--server` to the domain or pu
 ### Client profiles
 
 - `balanced`: general-purpose default
-- `reliable`: disables hopping for simpler connectivity
+- `reliable`: uses a slow fixed hop plus keepalive packets for lossy single-port environments
 - `stealth`: enables stronger camouflage options
 - `throughput`: keeps the path simpler for maximum delivery
+
+### Tunnel mode
+
+HopShot can also bridge a local TUN or TAP device for real packet forwarding. On Windows, the tunnel backend uses Wintun, so TAP requests are mapped to TUN because Windows does not expose a native TAP backend here.
+
+```bash
+# Client side
+python client.py --server 1.2.3.4 --seed "my-secret" \
+  --tunnel-mode tun --tunnel-iface hopshot0 \
+  --tunnel-address 10.7.0.2/30 --tunnel-peer 10.7.0.1 \
+  --tunnel-default-route
+
+# Server side
+python server.py --seed "my-secret" \
+  --tunnel-mode tun --tunnel-iface hopshot0 \
+  --tunnel-address 10.7.0.1/30
+```
+
+Tunnel mode requires Linux, root privileges, and `iproute2`. On Windows, install Wintun or Cloudflare WARP and run the CLI with administrator rights. TAP mode is still exposed in the CLI, but on Windows it falls back to Wintun-backed TUN.
+
+### Security note
+
+Do not keep the example `shared_seed` value in production configs. Use `python deploy.py genkey` to generate a fresh seed before deployment.
 
 ### Release CLI
 
@@ -130,11 +168,18 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 - `--diagnose` prints the resolved configuration and exits.
 - `--msg` sends one message and exits.
 
+### Roadmap / remaining gaps
+
+- Real TUN/TAP integration is still the biggest missing piece for routing arbitrary application traffic.
+- The current clock skew compensation and keepalive logic stabilize hopping, but they do not replace a true packet tunnel.
+
 ### Project layout
 
 - `client.py` - client CLI and transport pipeline
 - `server.py` - server CLI and receive pipeline
 - `common.py` - packet headers, hopping, and shared helpers
+- `tun_transport.py` - cross-platform TUN/TAP device helpers
+- `tunnel_codec.py` - shared packet encode/decode helpers for tunnel mode
 ## فارسی
 
 ### این پروژه چه کاری انجام می‌دهد
@@ -212,6 +257,25 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 - `stealth`: با تنظیمات مخفی‌سازی قوی‌تر
 - `throughput`: مسیر ساده‌تر برای تحویل بهتر
 
+### حالت Tunnel
+
+HopShot می‌تواند یک دستگاه Linux TUN یا TAP را برای عبور واقعی packetها bridge کند.
+
+```bash
+# سمت کلاینت
+python client.py --server 1.2.3.4 --seed "my-secret" \
+  --tunnel-mode tun --tunnel-iface hopshot0 \
+  --tunnel-address 10.7.0.2/30 --tunnel-peer 10.7.0.1 \
+  --tunnel-default-route
+
+# سمت سرور
+python server.py --seed "my-secret" \
+  --tunnel-mode tun --tunnel-iface hopshot0 \
+  --tunnel-address 10.7.0.1/30
+```
+
+این حالت به Linux، دسترسی root و `iproute2` نیاز دارد. TAP هم در کد expose شده است، ولی برای استفادهٔ درست معمولاً باید bridge یا routing خارجی هم تنظیم کنید.
+
 ### دستورهای نسخه و تشخیص
 
 ```bash
@@ -260,6 +324,10 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 - `--diagnose` تنظیمات نهایی را چاپ می‌کند و خارج می‌شود.
 - `--msg` یک پیام می‌فرستد و تمام می‌شود.
 
+### یادداشت امنیتی
+
+از مقدار نمونهٔ `shared_seed` در محیط واقعی استفاده نکنید. با `python deploy.py genkey` یک seed جدید و تصادفی بسازید.
+
 ### ساختار پروژه
 
 - `deploy.py` - bootstrapper خودکار برای سرور و کلاینت
@@ -276,6 +344,8 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 - `resolver.py` - DNS و probing مقصد
 - `session_resume.py` - کش tokenهای probe
 - `terminal_ui.py` - لاگ رنگی و formatting ترمینال
+- `tun_transport.py` - helperهای دستگاه Linux TUN/TAP
+- `tunnel_codec.py` - helperهای encode/decode برای tunnel mode
 - `test_hopshot.py` - تست‌های یکپارچه
 
 ### نکته

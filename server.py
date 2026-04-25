@@ -36,6 +36,8 @@ import brutal
 from quic_transport import QUICServer, generate_selfsigned_cert
 from http3_masq import HTTP3Masq
 from session_resume import SessionTokenManager
+from tunnel_codec import encode_datagrams
+from tun_transport import TunTapConfig, TunTapDevice, TunTapError
 from terminal_ui import configure_logging, key_value, section_header, supports_color, title
 from version import __version__
 
@@ -94,6 +96,12 @@ class HopShotServer:
         self.certfile    = cfg.get("certfile", "/tmp/hopshot.crt")
         self.keyfile     = cfg.get("keyfile",  "/tmp/hopshot.key")
         self.declared_down_kbps = cfg.get("declared_down_kbps", 0)
+        self.tunnel_mode = cfg.get("tunnel_mode", "off")
+        self.tunnel_iface = cfg.get("tunnel_iface", "hopshot0")
+        self.tunnel_mtu   = cfg.get("tunnel_mtu", 1400)
+        self.tunnel_addr  = cfg.get("tunnel_address")
+        self.tunnel_peer  = cfg.get("tunnel_peer")
+        self.tunnel_route_default = cfg.get("tunnel_route_default", False)
 
         self.sessions    = {}         # session_id → Session
         self.sess_lock   = threading.Lock()
@@ -101,6 +109,9 @@ class HopShotServer:
         self.del_lock    = threading.Lock()
         self._running    = False
         self.masquerade  = cfg.get("masquerade", False)
+        self._tun_seq    = 0
+        self._tun_seq_lock = threading.Lock()
+        self._tunnel_session_id = None
 
         # 0-RTT session resumption (TUIC-style)
         self._token_mgr  = SessionTokenManager(self.seed)
@@ -110,6 +121,21 @@ class HopShotServer:
 
         # QUIC server
         self.quic_srv = None
+        self._tunnel = None
+
+        if self.tunnel_mode != "off":
+            try:
+                self._tunnel = TunTapDevice.open(TunTapConfig(
+                    name=self.tunnel_iface,
+                    mode=self.tunnel_mode,
+                    mtu=self.tunnel_mtu,
+                    address=self.tunnel_addr,
+                    peer=self.tunnel_peer,
+                    up=True,
+                    route_default=self.tunnel_route_default,
+                ))
+            except TunTapError as e:
+                raise RuntimeError(f"Failed to initialize tunnel device: {e}") from e
 
         if self.verbose:
             log.debug(
@@ -117,7 +143,8 @@ class HopShotServer:
                 f"listen={self.listen_port} quic={self.quic_port} "
                 f"port_range={self.port_min}-{self.port_max} obfs={self.obfs} "
                 f"masq={self.masquerade} jitter={self.jitter} "
-                f"declared_down={self.declared_down_kbps} fec={self.fec_k}x{self.fec_m}"
+                f"declared_down={self.declared_down_kbps} fec={self.fec_k}x{self.fec_m} "
+                f"tunnel={self.tunnel_mode} iface={self.tunnel_iface}"
             )
 
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -154,6 +181,8 @@ class HopShotServer:
         # Threads
         threading.Thread(target=self._udp_loop,     daemon=True).start()
         threading.Thread(target=self._cleanup_loop,  daemon=True).start()
+        if self._tunnel is not None:
+            threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
 
         log.info("Server ready.")
 
@@ -213,6 +242,8 @@ class HopShotServer:
         elif t == common.TYPE_MTU_PROBE:
             # MTU probe: echo back with the size we actually received
             self._handle_mtu_probe(hdr, payload, addr, len(pkt))
+        elif t == common.TYPE_KEEPALIVE:
+            self._handle_keepalive(hdr, addr)
 
     # ── QUIC receive ──────────────────────────────────────────────────────────
 
@@ -233,6 +264,8 @@ class HopShotServer:
         t = hdr["type"]
         if t == common.TYPE_DATA:
             self._handle_data(hdr, payload, None, common.TRANSPORT_QUIC)
+        elif t == common.TYPE_KEEPALIVE:
+            self._handle_keepalive(hdr, None)
 
     # ── Probe handler ─────────────────────────────────────────────────────────
 
@@ -245,11 +278,12 @@ class HopShotServer:
         )
         # Issue a 0-RTT session token alongside first probe reply
         token = self._token_mgr.issue(hdr["session_id"])
-        reply = reply + token   # append token so client can cache it
+        server_ts = struct.pack("!Q", int(time.time() * 1000))
+        reply = reply + token + server_ts   # append token and server clock sample
         if self.verbose:
             log.debug(
                 f"[probe] reply seq={hdr['seq']} sess={hdr['session_id']} "
-                f"addr={addr} token={len(token)}B transport={transport}"
+                f"addr={addr} token={len(token)}B transport={transport} ts={int(time.time() * 1000)}"
             )
 
         if self.obfs:
@@ -259,7 +293,111 @@ class HopShotServer:
         except Exception:
             pass
         if self.verbose:
-            log.debug(f"Probe reply (with 0-RTT token) → {addr} seq={hdr['seq']}")
+            log.debug(f"Probe reply (with 0-RTT token + clock sample) → {addr} seq={hdr['seq']}")
+
+    def _handle_keepalive(self, hdr: dict, addr):
+        sess = self._get_session(hdr.get("session_id", 0), addr)
+        sess.last_seen = time.monotonic()
+        if self.verbose:
+            log.debug(f"[keepalive] sid={hdr.get('session_id', 0)} addr={addr}")
+
+    def _send_tunnel_payload(self, payload: bytes, sess: Session):
+        if sess.addr is None:
+            return
+
+        with self._tun_seq_lock:
+            self._tun_seq = (self._tun_seq + 1) & 0xFFFFFFFF
+            seq = self._tun_seq
+
+        encoded = encode_datagrams(
+            payload=payload,
+            seq=seq,
+            session_id=sess.session_id,
+            seed=self.seed,
+            fec_k=self.fec_k,
+            fec_m=self.fec_m,
+            jitter=self.jitter,
+            obfs=self.obfs,
+            masquerade=self.masquerade,
+            transport=common.TRANSPORT_RAW,
+        )
+
+        for pkt in encoded.datagrams:
+            try:
+                self.udp_sock.sendto(pkt, sess.addr)
+            except Exception:
+                if self.verbose:
+                    log.exception(f"[tunnel] send failed sess={sess.session_id} addr={sess.addr}")
+
+    def _tunnel_tx_loop(self):
+        if self._tunnel is None:
+            return
+
+        while self._running:
+            try:
+                pkt = self._tunnel.read(65535)
+                if not pkt:
+                    continue
+                with self.sess_lock:
+                    sessions = list(self.sessions.values())
+                    if self._tunnel_session_id is not None and self._tunnel_session_id in self.sessions:
+                        sessions = [self.sessions[self._tunnel_session_id]]
+                target = next((sess for sess in sessions if sess.addr is not None), None)
+                if target is None:
+                    continue
+                self._send_tunnel_payload(pkt, target)
+            except Exception as e:
+                if self._running and self.verbose:
+                    log.exception(f"[tunnel] tx loop: {e}")
+
+    def _send_tunnel_payload(self, payload: bytes, sess: Session):
+        if sess.addr is None:
+            return
+
+        with self._tun_seq_lock:
+            self._tun_seq = (self._tun_seq + 1) & 0xFFFFFFFF
+            seq = self._tun_seq
+
+        encoded = encode_datagrams(
+            payload=payload,
+            seq=seq,
+            session_id=sess.session_id,
+            seed=self.seed,
+            fec_k=self.fec_k,
+            fec_m=self.fec_m,
+            jitter=self.jitter,
+            obfs=self.obfs,
+            masquerade=self.masquerade,
+            transport=common.TRANSPORT_RAW,
+        )
+
+        for pkt in encoded.datagrams:
+            try:
+                self.udp_sock.sendto(pkt, sess.addr)
+            except Exception:
+                if self.verbose:
+                    log.exception(f"[tunnel] send failed sess={sess.session_id} addr={sess.addr}")
+
+    def _tunnel_tx_loop(self):
+        if self._tunnel is None:
+            return
+
+        while self._running:
+            try:
+                pkt = self._tunnel.read(65535)
+                if not pkt:
+                    continue
+                with self.sess_lock:
+                    sessions = list(self.sessions.values())
+                    if self._tunnel_session_id is not None and self._tunnel_session_id in self.sessions:
+                        sessions = [self.sessions[self._tunnel_session_id]]
+                target = next((sess for sess in sessions if sess.addr is not None), None)
+                if target is None:
+                    continue
+                self._send_tunnel_payload(pkt, target)
+            except Exception as e:
+                if self._running and self.verbose:
+                    log.exception(f"[tunnel] tx loop: {e}")
 
     def _handle_mtu_probe(self, hdr: dict, payload: bytes, addr, recv_size: int):
         """Echo back an MTU_REPLY carrying the received size."""
@@ -353,7 +491,14 @@ class HopShotServer:
 
     def _on_payload(self, sid, data: bytes, addr, transport, sess: Session):
         """Application delivery point — prints received payload."""
-        print(f"\n[DELIVERED] {len(data)} bytes: {data!r}\n")
+        if self._tunnel is not None:
+            try:
+                self._tunnel.write(data)
+            except Exception as e:
+                if self.verbose:
+                    log.exception(f"[tunnel] write failed sid={sid}: {e}")
+        else:
+            print(f"\n[DELIVERED] {len(data)} bytes: {data!r}\n")
         if self.verbose:
             log.debug(f"[PAYLOAD] sess={sid} transport={transport} bytes={len(data)}")
 
@@ -425,10 +570,14 @@ class HopShotServer:
                 )
                 if self.verbose:
                     log.debug(f"[session] created sid={sid} addr={addr}")
+                if self.tunnel_mode != "off" and self._tunnel_session_id is None:
+                    self._tunnel_session_id = sid
             elif addr and self.sessions[sid].addr is None:
                 self.sessions[sid].addr = addr
                 if self.verbose:
                     log.debug(f"[session] bound sid={sid} addr={addr}")
+                if self.tunnel_mode != "off" and self._tunnel_session_id is None:
+                    self._tunnel_session_id = sid
             return self.sessions[sid]
 
     def _cleanup_loop(self):
@@ -498,6 +647,11 @@ class HopShotServer:
             pass
         if self.quic_srv:
             self.quic_srv.stop()
+        if self._tunnel:
+            try:
+                self._tunnel.close()
+            except Exception:
+                pass
         if self.cfg.get("setup_iptables", False):
             self._remove_iptables()
         if self.verbose:
@@ -525,6 +679,18 @@ def main():
                         help="User-declared downlink bandwidth in kbps (0=auto)")
     parser.add_argument("--jitter",       type=int, default=64,
                         help="Jitter strip bytes (must match client --jitter, 0=off)")
+    parser.add_argument("--tunnel-mode",  choices=("off", "tun", "tap"), default="off",
+                        help="Enable a TUN/TAP device bridge")
+    parser.add_argument("--tunnel-iface", default="hopshot0",
+                        help="Tunnel interface name")
+    parser.add_argument("--tunnel-mtu",   type=int, default=1400,
+                        help="Tunnel interface MTU")
+    parser.add_argument("--tunnel-address", default=None,
+                        help="Tunnel interface address (e.g. 10.7.0.1/30)")
+    parser.add_argument("--tunnel-peer", default=None,
+                        help="Peer address for point-to-point tunnel mode")
+    parser.add_argument("--tunnel-default-route", action="store_true",
+                        help="Replace the default route with the tunnel interface")
     parser.add_argument("--log-file",     default=None,
                         help="Write logs to a file in addition to the terminal")
     parser.add_argument("--json-logs",    action="store_true",
@@ -550,6 +716,12 @@ def main():
         "declared_down_kbps": args.declared_down,
         "verbose":        args.verbose,
         "jitter_bytes":   args.jitter,
+        "tunnel_mode":    args.tunnel_mode,
+        "tunnel_iface":   args.tunnel_iface,
+        "tunnel_mtu":     args.tunnel_mtu,
+        "tunnel_address": args.tunnel_address,
+        "tunnel_peer":    args.tunnel_peer,
+        "tunnel_route_default": args.tunnel_default_route,
         "log_file":       args.log_file,
         "json_logs":      args.json_logs,
     }
@@ -557,6 +729,11 @@ def main():
     if args.config:
         with open(args.config) as f:
             cfg.update(json.load(f))
+
+    cfg["tunnel_backend"] = (
+        "wintun" if os.name == "nt" and cfg.get("tunnel_mode", "off") != "off"
+        else ("kernel" if cfg.get("tunnel_mode", "off") != "off" else "off")
+    )
 
     configure_logging(args.verbose, log_file=cfg.get("log_file"), json_logs=cfg.get("json_logs", False))
 
@@ -572,6 +749,7 @@ def main():
         key_value("obfs", "on" if cfg["obfs"] else "off", value_color="green" if cfg["obfs"] else "yellow", use_color=use_color),
         key_value("masquerade", "on" if cfg["masquerade"] else "off", value_color="green" if cfg["masquerade"] else "yellow", use_color=use_color),
         key_value("jitter", f"{cfg['jitter_bytes']}B", value_color="magenta", use_color=use_color),
+        key_value("tunnel", f"{cfg.get('tunnel_mode', 'off')} / {cfg.get('tunnel_backend', 'off')}", value_color="cyan", use_color=use_color),
     ]))
 
     if args.diagnose:
