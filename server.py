@@ -37,6 +37,7 @@ from quic_transport import QUICServer, generate_selfsigned_cert
 from http3_masq import HTTP3Masq
 from session_resume import SessionTokenManager
 from terminal_ui import configure_logging, colorize, title
+from version import __version__
 
 logging.basicConfig(
     level=logging.INFO,
@@ -509,6 +510,7 @@ class HopShotServer:
 def main():
     parser = argparse.ArgumentParser(description="HopShot Server")
     parser.add_argument("--config",       default=None,    help="JSON config file")
+    parser.add_argument("--version", action="version", version=f"HopShot Server {__version__}")
     parser.add_argument("--port",         type=int, default=10000, help="Raw UDP listen port")
     parser.add_argument("--quic-port",    type=int, default=10001, help="QUIC/TLS listen port")
     parser.add_argument("--port-min",     type=int, default=10000, help="Hop range min")
@@ -558,7 +560,7 @@ def main():
 
     configure_logging(args.verbose, log_file=cfg.get("log_file"), json_logs=cfg.get("json_logs", False))
 
-    print(title("HopShot Server", "cyan"))
+    print(title(f"HopShot Server v{__version__}", "cyan"))
     print(colorize(f"listen: {cfg['listen_port']}  quic: {cfg['quic_port']}", "green", bold=True))
     print(colorize(f"mode: obfs={cfg['obfs']} masq={cfg['masquerade']} jitter={cfg['jitter_bytes']}", "blue"))
 

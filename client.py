@@ -45,6 +45,7 @@ from http3_masq import HTTP3Masq
 from mtu_probe import MTUProber
 from session_resume import ResumeTokenStore, TOKEN_SIZE
 from terminal_ui import configure_logging, colorize, title
+from version import __version__
 
 logging.basicConfig(
     level=logging.INFO,
@@ -94,7 +95,7 @@ def apply_profile_overrides(cfg: dict) -> dict:
 
 def render_config_summary(cfg: dict) -> str:
     lines = [
-        title("HopShot Client", "cyan"),
+        title(f"HopShot Client v{__version__}", "cyan"),
         f"profile: {colorize(cfg['profile'], 'green', bold=True)}",
         f"server: {cfg['server_port']}  quic: {cfg['quic_port']}  dests: {len(cfg['destinations'])}",
         f"port-range: {cfg['port_min']}-{cfg['port_max']}  hop-disabled: {cfg.get('disable_hop', False)}",
@@ -733,6 +734,7 @@ Examples:
 
     p.add_argument("--config",          default=None,
                    help="JSON config file")
+    p.add_argument("--version", action="version", version=f"HopShot Client {__version__}")
     p.add_argument("--server",          default=None,
                    help="Server IP or hostname (single destination)")
     p.add_argument("--dest",            action="append", dest="destinations",
@@ -842,7 +844,7 @@ Examples:
         print(render_config_summary(cfg))
         return
 
-    print(title("HopShot Client", "cyan"))
+    print(title(f"HopShot Client v{__version__}", "cyan"))
     print(colorize(f"profile: {cfg['profile']}", "green", bold=True))
     if cfg.get("disable_hop"):
         print(colorize("hop routing disabled by profile", "yellow", bold=True))

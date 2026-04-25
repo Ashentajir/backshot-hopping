@@ -12,6 +12,7 @@ from client import probe_port, HopShotClient, PROFILE_PRESETS, apply_profile_ove
 from http3_masq import HTTP3Masq
 from resolver import Resolver, _query_resolver, _build_dns_query, _parse_dns_response
 from session_resume import ResumeTokenStore, TOKEN_SIZE
+from version import __version__
 
 PASS = "\033[92m✓\033[0m"
 FAIL = "\033[91m✗\033[0m"
@@ -215,6 +216,11 @@ def t_profile_overrides():
     assert cfg["preemptive_hop_ms"] == 0
     assert set(PROFILE_PRESETS) == {"balanced", "reliable", "stealth", "throughput"}
 test("profile presets map to safe operator modes", t_profile_overrides)
+
+def t_version_format():
+    parts = __version__.split(".")
+    assert len(parts) == 3 and all(part.isdigit() for part in parts), __version__
+test("release version is semver-like", t_version_format)
 
 # ── 5. Deterministic hopping ─────────────────────────────────────────────────
 print("\n[ Deterministic Port Hopping ]")
