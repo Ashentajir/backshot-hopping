@@ -713,8 +713,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic
+  # Basic client
   python3 client.py --server 1.2.3.4 --port 10000 --seed "mysecret"
+
+  # Balanced release profile
+  python3 client.py --server 1.2.3.4 --port 10000 --seed "mysecret" --profile balanced
+
+  # Reliable mode for strict firewalls
+  python3 client.py --server 1.2.3.4 --port 10000 --seed "mysecret" --profile reliable
 
   # Multiple destinations (burst across all IPs simultaneously)
   python3 client.py --dest 1.2.3.4 --dest 5.6.7.8 --port 10000 --seed "s"
@@ -723,10 +729,13 @@ Examples:
   python3 client.py --server vpn.example.com --port 10000 \\
       --resolver 1.1.1.1 --resolver 8.8.8.8 --resolver 9.9.9.9
 
-  # Full nuclear setup
+  # Full stealth setup
   python3 client.py --server 1.2.3.4 --port 10000 --seed "s" \\
-      --port-min 10000 --port-max 65000 --obfs \\
+      --port-min 10000 --port-max 65000 --profile stealth \\
       --rand-src-port --jitter 64 --preemptive-hop 800
+
+  # Diagnose final resolved config
+  python3 client.py --server 127.0.0.1 --dest 127.0.0.1 --diagnose
 
   # Send one message and exit
   python3 client.py --server 1.2.3.4 --port 10000 --seed "s" --msg "hello"
