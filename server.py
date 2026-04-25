@@ -96,6 +96,8 @@ class HopShotServer:
         self.certfile    = cfg.get("certfile", "/tmp/hopshot.crt")
         self.keyfile     = cfg.get("keyfile",  "/tmp/hopshot.key")
         self.declared_down_kbps = cfg.get("declared_down_kbps", 0)
+        self.max_ping_ms = int(cfg.get("max_ping_ms", 15000) or 15000)
+        self.session_timeout_sec = max(60, int((self.max_ping_ms * 3) / 1000))
         self.tunnel_mode = cfg.get("tunnel_mode", "off")
         self.tunnel_iface = cfg.get("tunnel_iface", "hopshot0")
         self.tunnel_mtu   = cfg.get("tunnel_mtu", 1400)
@@ -144,7 +146,8 @@ class HopShotServer:
                 f"port_range={self.port_min}-{self.port_max} obfs={self.obfs} "
                 f"masq={self.masquerade} jitter={self.jitter} "
                 f"declared_down={self.declared_down_kbps} fec={self.fec_k}x{self.fec_m} "
-                f"tunnel={self.tunnel_mode} iface={self.tunnel_iface}"
+                f"tunnel={self.tunnel_mode} iface={self.tunnel_iface} "
+                f"max_ping_ms={self.max_ping_ms} session_timeout={self.session_timeout_sec}s"
             )
 
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -587,7 +590,7 @@ class HopShotServer:
             with self.sess_lock:
                 dead = [
                     sid for sid, s in self.sessions.items()
-                    if now - s.last_seen > 60
+                    if now - s.last_seen > self.session_timeout_sec
                 ]
                 for sid in dead:
                     del self.sessions[sid]
@@ -677,6 +680,8 @@ def main():
     parser.add_argument("--keyfile",      default="/tmp/hopshot.key")
     parser.add_argument("--declared-down", type=int, default=0,
                         help="User-declared downlink bandwidth in kbps (0=auto)")
+    parser.add_argument("--max-ping-ms", type=int, default=15000,
+                        help="Maximum tolerated RTT/latency in ms for session paths")
     parser.add_argument("--jitter",       type=int, default=64,
                         help="Jitter strip bytes (must match client --jitter, 0=off)")
     parser.add_argument("--tunnel-mode",  choices=("off", "tun", "tap"), default="off",
@@ -714,6 +719,7 @@ def main():
         "certfile":       args.certfile,
         "keyfile":        args.keyfile,
         "declared_down_kbps": args.declared_down,
+        "max_ping_ms":    args.max_ping_ms,
         "verbose":        args.verbose,
         "jitter_bytes":   args.jitter,
         "tunnel_mode":    args.tunnel_mode,
@@ -749,6 +755,7 @@ def main():
         key_value("obfs", "on" if cfg["obfs"] else "off", value_color="green" if cfg["obfs"] else "yellow", use_color=use_color),
         key_value("masquerade", "on" if cfg["masquerade"] else "off", value_color="green" if cfg["masquerade"] else "yellow", use_color=use_color),
         key_value("jitter", f"{cfg['jitter_bytes']}B", value_color="magenta", use_color=use_color),
+        key_value("max-ping", f"{cfg.get('max_ping_ms', 15000)}ms", value_color="cyan", use_color=use_color),
         key_value("tunnel", f"{cfg.get('tunnel_mode', 'off')} / {cfg.get('tunnel_backend', 'off')}", value_color="cyan", use_color=use_color),
     ]))
 

@@ -4,6 +4,7 @@
   "port_min": 10000,
   "port_max": 65000,
   "shared_seed": "change-me",
+  "max_ping_ms": 15000,
   "obfs": false,
   "masquerade": false,
   "setup_iptables": false,

@@ -89,11 +89,13 @@ class QUICClient:
     Data is sent as length-prefixed records over TLS.
     """
 
-    def __init__(self, host: str, port: int, cafile=None, verify=False):
+    def __init__(self, host: str, port: int, cafile=None, verify=False,
+                 connect_timeout: float = 5.0):
         self.host    = host
         self.port    = port
         self.cafile  = cafile
         self.verify  = verify
+        self.connect_timeout = connect_timeout
         self._sock   = None
         self._ssl    = None
         self._recv_q = queue.Queue()
@@ -108,7 +110,7 @@ class QUICClient:
             ctx.load_verify_locations(self.cafile)
 
         try:
-            raw = socket.create_connection((self.host, self.port), timeout=5)
+            raw = socket.create_connection((self.host, self.port), timeout=self.connect_timeout)
             self._ssl = ctx.wrap_socket(raw, server_hostname=self.host)
             self._running = True
             threading.Thread(target=self._read_loop, daemon=True).start()

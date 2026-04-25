@@ -92,6 +92,7 @@ def base_cfg(port, **kw):
         "shared_seed": "test-seed", "obfs": False,
         "rand_src_port": False, "jitter_bytes": 0,
         "preemptive_hop_ms": 800,
+        "max_ping_ms": 15000,
         "fec_k": 4, "fec_m": 4,
         "probe_count": 5, "probe_timeout_ms": 1000,
         "verbose": False, "destinations": ["127.0.0.1"],
@@ -652,6 +653,70 @@ def t_e2e_nuclear():
     c.stop(); srv.alive=False
     assert rx and rx[0]==msg
 test("NUCLEAR mode: 8x burst, data delivered", t_e2e_nuclear)
+
+def t_adaptive_mode_forces_auto_hop_burst():
+    cfg = base_cfg(19790, adaptive_mode=True, disable_hop=True, fixed_hop_ms=2500, manual_burst_mult=9)
+    c = HopShotClient(cfg)
+    try:
+        assert c.adaptive_mode is True
+        assert c.disable_hop is False
+        assert c.fixed_hop_ms == 0
+        assert c.manual_burst_mult == 0
+    finally:
+        c.stop()
+test("adaptive mode keeps loss-based hop/burst automation enabled", t_adaptive_mode_forces_auto_hop_burst)
+
+def t_nuclear_fallback_forces_multiport_fanout():
+    cfg = base_cfg(
+        19820,
+        adaptive_mode=False,
+        disable_hop=True,
+        port_min=19820,
+        port_max=19880,
+    )
+    c = HopShotClient(cfg)
+    try:
+        c.mode = common.MODE_NUCLEAR
+        c.hop_ms, c.burst_mult = common.MODE_PARAMS[common.MODE_NUCLEAR]
+        ports = {
+            c._select_dst_port(
+                seq=7,
+                shard_idx=0,
+                burst_idx=i,
+                hop_ms=c.hop_ms,
+                burst_mult=c.burst_mult,
+                force_multi_port=True,
+            )
+            for i in range(c.burst_mult)
+        }
+        assert len(ports) > 1
+    finally:
+        c.stop()
+test("NUCLEAR fallback can fan burst across multiple ports", t_nuclear_fallback_forces_multiport_fanout)
+
+def t_max_ping_propagates_to_quic_timeout():
+    observed = {}
+    original_quic = clientmod.QUICClient
+
+    class ObserveQUIC:
+        def __init__(self, host, port, cafile=None, verify=False, connect_timeout=5.0):
+            observed["timeout"] = connect_timeout
+        def connect(self):
+            return False
+        def close(self):
+            pass
+
+    clientmod.QUICClient = ObserveQUIC
+    c = None
+    try:
+        c = HopShotClient(base_cfg(19850, max_ping_ms=15000))
+        c._connect_quic()
+        assert observed.get("timeout", 0) >= 15.0
+    finally:
+        if c is not None:
+            c.stop()
+        clientmod.QUICClient = original_quic
+test("max_ping_ms is honored by QUIC connect timeout", t_max_ping_propagates_to_quic_timeout)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 print("\n" + "="*50)

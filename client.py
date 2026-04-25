@@ -106,10 +106,16 @@ def render_config_summary(cfg: dict) -> str:
     obfs_state = "on" if cfg["obfs"] else "off"
     masq_state = "on" if cfg["masquerade"] else "off"
     rand_src_state = "on" if cfg["rand_src_port"] else "off"
+    burst_override = cfg.get("manual_burst_mult", 0)
+    burst_text = f"auto (mode)" if not burst_override else f"x{burst_override}"
+    adaptive_state = "on" if cfg.get("adaptive_mode", True) else "off"
+    max_ping_ms = cfg.get("max_ping_ms", 15000)
     lines = [
         title(f"HopShot Client v{__version__}", "cyan", use_color=use_color),
         section_header("Session", "cyan", use_color=use_color),
         key_value("profile", cfg["profile"], value_color="green", use_color=use_color),
+        key_value("adaptive", adaptive_state, value_color="green" if cfg.get("adaptive_mode", True) else "yellow", use_color=use_color),
+        key_value("max-ping", f"{max_ping_ms}ms", value_color="cyan", use_color=use_color),
         key_value("server", f"{cfg['server_port']} / {cfg['quic_port']}  dests={len(destinations)}", value_color="blue", use_color=use_color),
         key_value("ports", f"{cfg['port_min']}-{cfg['port_max']}  hop={hop_state}", value_color="yellow" if hop_state == "off" else "green", use_color=use_color),
         "",
@@ -119,6 +125,7 @@ def render_config_summary(cfg: dict) -> str:
         key_value("rand-src", rand_src_state, value_color="green" if cfg["rand_src_port"] else "yellow", use_color=use_color),
         key_value("jitter", f"{cfg['jitter_bytes']}B  preemptive={cfg['preemptive_hop_ms']}ms", value_color="cyan", use_color=use_color),
         key_value("fixed-hop", f"{cfg.get('fixed_hop_ms', 0)}ms", value_color="cyan", use_color=use_color),
+        key_value("raw burst", burst_text, value_color="cyan", use_color=use_color),
         key_value("keepalive", f"{cfg.get('keepalive_interval_sec', 0)}s", value_color="cyan", use_color=use_color),
         key_value("clock offset", f"{cfg.get('clock_offset_ms', 0)}ms", value_color="white", use_color=use_color),
         key_value("tunnel", f"{cfg.get('tunnel_mode', 'off')} / {cfg.get('tunnel_backend', 'off')}", value_color="cyan", use_color=use_color),
@@ -235,13 +242,14 @@ def probe_port(server_ip, port, count=20, timeout_ms=2000,
 
 def reactive_probe(server_ip, port, seed, obfs,
                    threshold=common.REACTIVE_LOSS_THRESHOLD,
-                   resume_store=None, verbose=False):
+                   resume_store=None, verbose=False,
+                   timeout_ms=800):
     """
     Quick 5-packet burst to check if current port is being throttled.
     Returns (loss_pct, should_hop).
     Used right before sending real data.
     """
-    r = probe_port(server_ip, port, count=5, timeout_ms=800,
+    r = probe_port(server_ip, port, count=5, timeout_ms=timeout_ms,
                    seed=seed, obfs=obfs, resume_store=resume_store,
                    verbose=verbose)
     should_hop = r["loss_pct"] >= threshold
@@ -275,9 +283,19 @@ class HopShotClient:
         self.preemptive   = cfg.get("preemptive_hop_ms",
                                     common.PREEMPTIVE_HOP_MS)
         self.fixed_hop_ms = cfg.get("fixed_hop_ms", 0)
+        self.manual_burst_mult = max(0, int(cfg.get("manual_burst_mult", 0) or 0))
         self.keepalive_interval_sec = cfg.get("keepalive_interval_sec", 15)
         self.clock_offset_ms = cfg.get("clock_offset_ms", 0)
         self.disable_hop  = cfg.get("disable_hop", False)
+        self.adaptive_mode = cfg.get("adaptive_mode", True)
+        self.max_ping_ms = int(cfg.get("max_ping_ms", 15000) or 15000)
+        self.nuclear_fail_fanout = cfg.get("nuclear_fail_fanout", True)
+        self.reactive_probe_enabled = cfg.get("reactive_probe", self.max_ping_ms <= 5000)
+
+        if self.adaptive_mode:
+            self.disable_hop = False
+            self.fixed_hop_ms = 0
+            self.manual_burst_mult = 0
         self.tunnel_mode  = cfg.get("tunnel_mode", "off")
         self.tunnel_iface = cfg.get("tunnel_iface", "hopshot0")
         self.tunnel_mtu   = cfg.get("tunnel_mtu", 1400)
@@ -465,6 +483,8 @@ class HopShotClient:
             self.hop_ms, self.burst_mult = common.MODE_PARAMS[self.mode]
             if self.fixed_hop_ms > 0:
                 self.hop_ms = self.fixed_hop_ms
+            if self.manual_burst_mult > 0:
+                self.burst_mult = self.manual_burst_mult
         log.info(
             f"[mode] -> {common.MODE_NAMES[self.mode]}  "
             f"hop={self.hop_ms}ms  burst=x{self.burst_mult}"
@@ -480,7 +500,12 @@ class HopShotClient:
         try:
             if self.verbose:
                 log.debug(f"[QUIC] connecting to {self.primary_ip}:{self.quic_port}")
-            self.quic    = QUICClient(self.primary_ip, self.quic_port, verify=False)
+            self.quic    = QUICClient(
+                self.primary_ip,
+                self.quic_port,
+                verify=False,
+                connect_timeout=max(5.0, self.max_ping_ms / 1000.0),
+            )
             self.quic_ok = self.quic.connect()
             if self.quic_ok:
                 log.info("[QUIC] connected (TLS 1.3)")
@@ -527,9 +552,21 @@ class HopShotClient:
 
         # ── Reactive pre-probe: check current port before sending ─────────────
         cur_port = self._hop_port(0, hop_ms)
-        _, should_hop = reactive_probe(
-            self.primary_ip, cur_port, self.seed, self.obfs,
-            resume_store=self._resume_store, verbose=self.verbose,
+        should_hop = False
+        if self.reactive_probe_enabled:
+            reactive_timeout_ms = min(max(800, self.max_ping_ms), 15000)
+            _, should_hop = reactive_probe(
+                self.primary_ip, cur_port, self.seed, self.obfs,
+                resume_store=self._resume_store,
+                verbose=self.verbose,
+                timeout_ms=reactive_timeout_ms,
+            )
+        elif self.verbose:
+            log.debug("[reactive] skipped (high-latency mode)")
+        nuclear_force_multi_port = (
+            self.nuclear_fail_fanout
+            and mode == common.MODE_NUCLEAR
+            and should_hop
         )
         if should_hop:
             # Force immediate slot advance so next hop_port() gives a new port
@@ -592,7 +629,14 @@ class HopShotClient:
             self.cc.pace(len(pkt))
 
             # ── Burst across ports AND destinations ───────────────────────────
-            self._burst_send(pkt, shard_idx, seq, hop_ms, burst_mult)
+            self._burst_send(
+                pkt,
+                shard_idx,
+                seq,
+                hop_ms,
+                burst_mult,
+                force_multi_port=nuclear_force_multi_port,
+            )
 
             # ── QUIC path simultaneously ──────────────────────────────────────
             if self.quic_ok and self.quic:
@@ -621,8 +665,23 @@ class HopShotClient:
 
     # ── Burst + hop + multi-dest ──────────────────────────────────────────────
 
+    def _select_dst_port(self, seq: int, shard_idx: int, burst_idx: int,
+                         hop_ms: int, burst_mult: int,
+                         force_multi_port: bool = False) -> int:
+        offset = shard_idx * burst_mult + burst_idx
+        if not force_multi_port:
+            return self._hop_port(offset, hop_ms)
+
+        # Fallback fanout when NUCLEAR mode still reports severe loss:
+        # keep burst intensity, but fan copies across deterministic multi-port slots.
+        eff_ms = max(800, min(self.preemptive, 1000))
+        salt_offset = (seq * 31) + offset + 100_000
+        slot = common.time_slot_randomized(eff_ms, self.seed, salt_offset, self.clock_offset_ms)
+        return common.deterministic_port(self.seed, slot, self.port_min, self.port_max)
+
     def _burst_send(self, pkt: bytes, shard_idx: int, seq: int,
-                    hop_ms: int, burst_mult: int, sock=None):
+                    hop_ms: int, burst_mult: int, sock=None,
+                    force_multi_port: bool = False):
         """
         Send pkt x burst_mult times.
         Each copy goes to a DIFFERENT (deterministic) port.
@@ -632,7 +691,14 @@ class HopShotClient:
         dest_count = len(self.dest_ips)
         for burst in range(burst_mult):
             dest_ip  = self.dest_ips[burst % dest_count]
-            dst_port = self._hop_port(shard_idx * burst_mult + burst, hop_ms)
+            dst_port = self._select_dst_port(
+                seq,
+                shard_idx,
+                burst,
+                hop_ms,
+                burst_mult,
+                force_multi_port=force_multi_port,
+            )
             src_port = random.randint(1024, 65535) if self.rand_src else 0
 
             if self.verbose:
@@ -976,6 +1042,16 @@ Examples:
                         "Hop before ISP throttle window (~800ms beats most DPI)")
     p.add_argument("--fixed-hop-ms",    type=int, default=0,
                    help="Force a fixed hop interval for the selected profile (0=mode-based)")
+    p.add_argument("--disable-hop",     action="store_true",
+                   help="Disable hopping and stick to the base server port")
+    p.add_argument("--manual-burst",    type=int, default=0,
+                   help="Override adaptive burst multiplier (0=mode-based)")
+    p.add_argument("--adaptive-mode", dest="adaptive_mode", action="store_true", default=True,
+                   help="Enable loss-based adaptive hop/burst mode (default)")
+    p.add_argument("--no-adaptive-mode", dest="adaptive_mode", action="store_false",
+                   help="Disable adaptive mode and allow manual hop/burst overrides")
+    p.add_argument("--max-ping-ms", type=int, default=15000,
+                   help="Maximum tolerated RTT/latency in ms for connection-oriented paths")
     p.add_argument("--keepalive-sec",   type=int, default=15,
                    help="Send a small keepalive packet every N seconds (0=off)")
     p.add_argument("--tunnel-mode",     choices=("off", "tun", "tap"), default="off",
@@ -1036,6 +1112,10 @@ Examples:
         "jitter_bytes":      args.jitter,
         "preemptive_hop_ms": args.preemptive_hop,
         "fixed_hop_ms":      args.fixed_hop_ms,
+        "disable_hop":       args.disable_hop,
+        "manual_burst_mult": args.manual_burst,
+        "adaptive_mode":     args.adaptive_mode,
+        "max_ping_ms":       args.max_ping_ms,
         "keepalive_interval_sec": args.keepalive_sec,
         "tunnel_mode":       args.tunnel_mode,
         "tunnel_iface":      args.tunnel_iface,
