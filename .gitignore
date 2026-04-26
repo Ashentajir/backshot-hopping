@@ -8,3 +8,4 @@ dist/
 server.config.json
 client.config.json
 *.log
+.continue
