@@ -114,6 +114,29 @@ python server.py --seed "my-secret" \
   --tunnel-address 10.7.0.1/30
 ```
 
+### Userspace UDP relay mode (alternative to TUN/TAP)
+
+If TUN/TAP is unavailable, run both sides with `--tunnel-mode udp`.
+This uses a local UDP relay socket on each side and still goes through the
+same FEC + hopping + obfuscation pipeline.
+
+```bash
+# Client side
+python client.py --server 1.2.3.4 --seed "my-secret" \
+  --tunnel-mode udp \
+  --tunnel-udp-bind 127.0.0.1:19090 \
+  --tunnel-udp-target 127.0.0.1:19091
+
+# Server side
+python server.py --seed "my-secret" \
+  --tunnel-mode udp \
+  --tunnel-udp-bind 127.0.0.1:19091 \
+  --tunnel-udp-target 127.0.0.1:19090
+```
+
+Without `--tunnel-udp-target`, each side will send return traffic to the most
+recent local UDP source that wrote into the relay socket.
+
 Tunnel mode requires Linux, root privileges, and `iproute2`. On Windows, install Wintun or Cloudflare WARP and run the CLI with administrator rights. TAP mode is still exposed in the CLI, but on Windows it falls back to Wintun-backed TUN.
 
 ### Security note

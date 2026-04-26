@@ -7,6 +7,8 @@ Public API:
     reconstruct_data(shards, k, m, orig_len) → bytes
 """
 
+import threading
+
 # ─── GF(2^8) arithmetic ───────────────────────────────────────────────────────
 
 _POLY = 0x11d   # x^8 + x^4 + x^3 + x^2 + 1
@@ -92,12 +94,36 @@ def _build_enc_matrix(k, m):
 
 # Pre-build matrices for common (k=4, m=4) — avoids rebuilding every call
 _ENC_CACHE = {}
+_INV_SUBMATRIX_CACHE = {}
+_INV_CACHE_MAX = 4096
+_CACHE_LOCK = threading.Lock()
 
 def _get_enc_matrix(k, m):
     key = (k, m)
-    if key not in _ENC_CACHE:
-        _ENC_CACHE[key] = _build_enc_matrix(k, m)
-    return _ENC_CACHE[key]
+    with _CACHE_LOCK:
+        mat = _ENC_CACHE.get(key)
+        if mat is None:
+            mat = _build_enc_matrix(k, m)
+            _ENC_CACHE[key] = mat
+        return mat
+
+
+def _get_inv_submatrix(sub, k, m, present_rows):
+    """Cache inverse of the kxk decode sub-matrix by row selection."""
+    key = (k, m, tuple(present_rows))
+    with _CACHE_LOCK:
+        cached = _INV_SUBMATRIX_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    inv = _invert_matrix(sub, k)
+
+    with _CACHE_LOCK:
+        if key not in _INV_SUBMATRIX_CACHE:
+            _INV_SUBMATRIX_CACHE[key] = inv
+            if len(_INV_SUBMATRIX_CACHE) > _INV_CACHE_MAX:
+                _INV_SUBMATRIX_CACHE.pop(next(iter(_INV_SUBMATRIX_CACHE)))
+        return _INV_SUBMATRIX_CACHE[key]
 
 # ─── Encode ───────────────────────────────────────────────────────────────────
 
@@ -142,7 +168,7 @@ def _reconstruct(all_shards, k, m):
     sub = [mat[idx][:] for idx in present]
     inputs = [all_shards[idx] for idx in present]
 
-    inv = _invert_matrix(sub, k)
+    inv = _get_inv_submatrix(sub, k, m, present)
 
     # Recover each data shard
     result = []

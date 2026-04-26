@@ -186,6 +186,18 @@ def t_fec_large():
     assert fecmod.reconstruct_data(shards,4,4,orig)==msg
 test("2KB payload, 3/8 shards lost", t_fec_large)
 
+def t_fec_inverse_cache_reuse():
+    msg = b"inverse cache payload" * 4
+    shards, orig = fecmod.split_and_encode(msg, 5, 3)
+    shards[0] = None
+    shards[2] = None
+    assert fecmod.reconstruct_data(shards, 5, 3, orig) == msg
+    cache_before = len(fecmod._INV_SUBMATRIX_CACHE)
+    assert fecmod.reconstruct_data(shards, 5, 3, orig) == msg
+    cache_after = len(fecmod._INV_SUBMATRIX_CACHE)
+    assert cache_after == cache_before
+test("inverse sub-matrix cache reuses repeated decode paths", t_fec_inverse_cache_reuse)
+
 # ── 2. Jitter padding ────────────────────────────────────────────────────────
 print("\n[ Packet Size Jitter ]")
 
@@ -283,6 +295,17 @@ def t_version_format():
     parts = __version__.split(".")
     assert len(parts) == 3 and all(part.isdigit() for part in parts), __version__
 test("release version is semver-like", t_version_format)
+
+def t_udp_endpoint_parser():
+    assert clientmod._parse_udp_endpoint("127.0.0.1:19090", "127.0.0.1", 1) == ("127.0.0.1", 19090)
+    assert clientmod._parse_udp_endpoint(None, "0.0.0.0", 19090) == ("0.0.0.0", 19090)
+    try:
+        clientmod._parse_udp_endpoint("bad-endpoint", "127.0.0.1", 1)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("expected ValueError for invalid endpoint")
+test("userspace UDP endpoint parser validates host:port", t_udp_endpoint_parser)
 
 # ── 5. Deterministic hopping ─────────────────────────────────────────────────
 print("\n[ Deterministic Port Hopping ]")

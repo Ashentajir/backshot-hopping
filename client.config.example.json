@@ -21,6 +21,8 @@
   "tunnel_address": null,
   "tunnel_peer": null,
   "tunnel_route_default": false,
+  "tunnel_udp_bind": "127.0.0.1:19090",
+  "tunnel_udp_target": null,
   "declared_up_kbps": 0,
   "masquerade": false,
   "mtu": 0,

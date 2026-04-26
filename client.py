@@ -158,6 +158,23 @@ def build_network_recommendation(tcp_tls_clear: bool, udp_throttled: bool, udp_p
     }
 
 
+def _parse_udp_endpoint(value: str | None, default_host: str, default_port: int) -> tuple[str, int]:
+    text = str(value or "").strip()
+    if not text:
+        return default_host, default_port
+    if ":" not in text:
+        raise ValueError(f"Invalid endpoint '{text}', expected host:port")
+    host, port_text = text.rsplit(":", 1)
+    host = host.strip() or default_host
+    try:
+        port = int(port_text)
+    except ValueError as e:
+        raise ValueError(f"Invalid endpoint '{text}', bad port") from e
+    if port < 1 or port > 65535:
+        raise ValueError(f"Invalid endpoint '{text}', port out of range")
+    return host, port
+
+
 def _tcp_tls_path_check(target_ip: str, target_port: int = 443, timeout_sec: float = 2.0) -> bool:
     try:
         with socket.create_connection((target_ip, target_port), timeout=timeout_sec):
@@ -418,7 +435,12 @@ class HopShotClient:
         self.tunnel_addr  = cfg.get("tunnel_address")
         self.tunnel_peer   = cfg.get("tunnel_peer")
         self.tunnel_route_default = cfg.get("tunnel_route_default", False)
+        self.tunnel_udp_bind = cfg.get("tunnel_udp_bind", "127.0.0.1:19090")
+        self.tunnel_udp_target = cfg.get("tunnel_udp_target")
         self._transport_sock = None
+        self._tunnel_udp_sock = None
+        self._tunnel_udp_target_addr = None
+        self._tunnel_last_local_peer = None
         self._transport_lock = threading.Lock()
         self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._udp_sock.bind(("0.0.0.0", int(cfg.get("local_port", 0) or 0)))
@@ -492,7 +514,7 @@ class HopShotClient:
 
         self._running     = False
 
-        if self.tunnel_mode != "off":
+        if self.tunnel_mode in {"tun", "tap"}:
             try:
                 self._tunnel = TunTapDevice.open(TunTapConfig(
                     name=self.tunnel_iface,
@@ -508,6 +530,19 @@ class HopShotClient:
             self._transport_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self._transport_sock.bind(("0.0.0.0", cfg.get("tunnel_local_port", 0)))
             self._transport_sock.settimeout(1.0)
+        elif self.tunnel_mode == "udp":
+            self._transport_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._transport_sock.bind(("0.0.0.0", cfg.get("tunnel_local_port", 0)))
+            self._transport_sock.settimeout(1.0)
+
+            bind_addr = _parse_udp_endpoint(self.tunnel_udp_bind, "127.0.0.1", 19090)
+            self._tunnel_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._tunnel_udp_sock.bind(bind_addr)
+            self._tunnel_udp_sock.settimeout(1.0)
+            self._tunnel_udp_target_addr = _parse_udp_endpoint(self.tunnel_udp_target, "127.0.0.1", 19091) if self.tunnel_udp_target else None
+            log.info(f"[tunnel-udp] local relay bind={bind_addr[0]}:{bind_addr[1]} target={self._tunnel_udp_target_addr}")
+        elif self.tunnel_mode != "off":
+            raise RuntimeError(f"Unsupported tunnel_mode: {self.tunnel_mode}")
 
         if self.verbose:
             log.debug(
@@ -519,6 +554,7 @@ class HopShotClient:
                 f"fixed_hop={self.fixed_hop_ms} keepalive={self.keepalive_interval_sec}s "
                 f"clock_offset={self.clock_offset_ms}ms "
                 f"tunnel={self.tunnel_mode} iface={self.tunnel_iface} "
+                f"tunnel_udp_bind={self.tunnel_udp_bind} tunnel_udp_target={self.tunnel_udp_target} "
                 f"disable_hop={self.disable_hop} profile={self.cfg.get('profile', 'balanced')} "
                 f"fec={self.fec_k}x{self.fec_m} declared_up={cfg.get('declared_up_kbps', 0)} "
                 f"resume_store={self._resume_store.has_token}"
@@ -674,12 +710,12 @@ class HopShotClient:
 
         # Background loops
         # Non-tunnel mode receives BW feedback on the stable raw UDP socket.
-        if self._tunnel is None:
+        if self.tunnel_mode == "off":
             threading.Thread(target=self._feedback_listener, daemon=True).start()
         threading.Thread(target=self._monitor_loop,      daemon=True).start()
         if self.keepalive_interval_sec > 0:
             threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        if self._tunnel is not None:
+        if self.tunnel_mode != "off" and self._transport_sock is not None:
             threading.Thread(target=self._tunnel_rx_loop, daemon=True).start()
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
 
@@ -1061,7 +1097,7 @@ class HopShotClient:
         self._record_metric("tunnel_send", seq=seq, rate=rate, rtt=rtt, payload=len(payload))
 
     def _tunnel_rx_loop(self):
-        if self._transport_sock is None or self._tunnel is None:
+        if self._transport_sock is None:
             return
         buf = bytearray(common.MAX_PACKET + 256)
         while self._running:
@@ -1076,7 +1112,12 @@ class HopShotClient:
                 if hdr["type"] == common.TYPE_DATA:
                     recovered = self._tunnel_assembler.push(hdr, payload)
                     if recovered is not None:
-                        self._tunnel.write(recovered)
+                        if self._tunnel is not None:
+                            self._tunnel.write(recovered)
+                        elif self._tunnel_udp_sock is not None:
+                            target = self._tunnel_udp_target_addr or self._tunnel_last_local_peer
+                            if target:
+                                self._tunnel_udp_sock.sendto(recovered, target)
                 elif hdr["type"] == common.TYPE_BW_FEEDBACK:
                     fb = common.unpack_bw_feedback(payload)
                     if fb:
@@ -1099,14 +1140,20 @@ class HopShotClient:
         Tunnel mode bypasses per-packet reactive probing because probe-before-send
         on every IP packet becomes prohibitively expensive for sustained traffic.
         """
-        if self._tunnel is None:
+        if self._tunnel is None and self._tunnel_udp_sock is None:
             return
         while self._running:
             try:
-                pkt = self._tunnel.read(65535)
+                if self._tunnel is not None:
+                    pkt = self._tunnel.read(65535)
+                else:
+                    pkt, peer = self._tunnel_udp_sock.recvfrom(65535)
+                    self._tunnel_last_local_peer = peer
                 if not pkt:
                     continue
                 self._send_tunnel_payload(pkt)
+            except socket.timeout:
+                pass
             except Exception as e:
                 if self._running and self.verbose:
                     log.exception(f"[tunnel] tx loop: {e}")
@@ -1239,6 +1286,11 @@ class HopShotClient:
                 self._transport_sock.close()
             except Exception:
                 pass
+        if self._tunnel_udp_sock:
+            try:
+                self._tunnel_udp_sock.close()
+            except Exception:
+                pass
         if self._tunnel:
             try:
                 self._tunnel.close()
@@ -1343,8 +1395,8 @@ Examples:
                    help="Maximum tolerated RTT/latency in ms for connection-oriented paths")
     p.add_argument("--keepalive-sec",   type=int, default=15,
                    help="Send a small keepalive packet every N seconds (0=off)")
-    p.add_argument("--tunnel-mode",     choices=("off", "tun", "tap"), default="off",
-                   help="Enable a TUN/TAP device bridge")
+    p.add_argument("--tunnel-mode",     choices=("off", "tun", "tap", "udp"), default="off",
+                   help="Enable a TUN/TAP device bridge or userspace UDP relay")
     p.add_argument("--tunnel-iface",    default="hopshot0",
                    help="Tunnel interface name")
     p.add_argument("--tunnel-mtu",      type=int, default=1400,
@@ -1357,6 +1409,10 @@ Examples:
                    help="Replace the default route with the tunnel interface")
     p.add_argument("--tunnel-local-port", type=int, default=0,
                    help="Local UDP port for tunnel mode (0=auto)")
+    p.add_argument("--tunnel-udp-bind", default="127.0.0.1:19090",
+                   help="Userspace UDP relay bind endpoint host:port")
+    p.add_argument("--tunnel-udp-target", default=None,
+                   help="Userspace UDP relay egress target host:port")
     p.add_argument("--declared-up",     type=int, default=0,
                    help="User-declared uplink bandwidth in kbps (0=auto). "
                         "Sets Brutal CC ceiling — prevents ISP QoS triggers. "
@@ -1422,6 +1478,8 @@ Examples:
         "tunnel_peer":       args.tunnel_peer,
         "tunnel_route_default": args.tunnel_default_route,
         "tunnel_local_port": args.tunnel_local_port,
+        "tunnel_udp_bind": args.tunnel_udp_bind,
+        "tunnel_udp_target": args.tunnel_udp_target,
         "declared_up_kbps":  args.declared_up,
         "masquerade":        args.masquerade,
         "mtu":               args.mtu,
@@ -1449,10 +1507,15 @@ Examples:
         with open(args.config) as f:
             cfg.update(json.load(f))
 
-    cfg["tunnel_backend"] = (
-        "wintun" if os.name == "nt" and cfg.get("tunnel_mode", "off") != "off"
-        else ("kernel" if cfg.get("tunnel_mode", "off") != "off" else "off")
-    )
+    mode = cfg.get("tunnel_mode", "off")
+    if mode == "off":
+        cfg["tunnel_backend"] = "off"
+    elif mode == "udp":
+        cfg["tunnel_backend"] = "userspace-udp"
+    elif os.name == "nt":
+        cfg["tunnel_backend"] = "wintun"
+    else:
+        cfg["tunnel_backend"] = "kernel"
 
     cfg = apply_profile_overrides(cfg)
 

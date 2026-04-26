@@ -9,3 +9,4 @@ server.config.json
 client.config.json
 *.log
 .continue
+new-mcp-server.yaml
