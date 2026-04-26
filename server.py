@@ -35,7 +35,7 @@ import fec as fecmod
 import brutal
 from quic_transport import QUICServer, generate_selfsigned_cert
 from http3_masq import HTTP3Masq
-from session_resume import SessionTokenManager
+from session_resume import SessionTokenManager, TOKEN_SIZE
 from tunnel_codec import encode_datagrams
 from tun_transport import TunTapConfig, TunTapDevice, TunTapError
 from terminal_ui import configure_logging, key_value, section_header, supports_color, title
@@ -293,6 +293,8 @@ class HopShotServer:
             )
         if t == common.TYPE_PROBE:
             self._handle_probe(hdr, addr, common.TRANSPORT_RAW, tx_sock=recv_sock)
+        elif t == common.TYPE_RESUME:
+            self._handle_resume(hdr, payload, addr, common.TRANSPORT_RAW, tx_sock=recv_sock)
         elif t == common.TYPE_DATA:
             self._handle_data(hdr, payload, addr, common.TRANSPORT_RAW, tx_sock=recv_sock)
         elif t == common.TYPE_MTU_PROBE:
@@ -357,6 +359,41 @@ class HopShotServer:
         sess.last_seen = time.monotonic()
         if self.verbose:
             log.debug(f"[keepalive] sid={hdr.get('session_id', 0)} addr={addr}")
+
+    def _handle_resume(self, hdr: dict, payload: bytes, addr, transport: int, tx_sock: socket.socket | None = None):
+        tx_sock = tx_sock or self.udp_sock
+        sid = hdr.get("session_id", 0)
+        if len(payload) < TOKEN_SIZE:
+            if self.verbose:
+                log.debug(f"[resume] short token sid={sid} len={len(payload)}")
+            return
+
+        token = payload[:TOKEN_SIZE]
+        if not self._token_mgr.verify(token, sid):
+            if self.verbose:
+                log.debug(f"[resume] token verify failed sid={sid} addr={addr}")
+            return
+
+        sess = self._get_session(sid, addr)
+        sess.last_seen = time.monotonic()
+
+        # Rotate token on successful resume.
+        new_token = self._token_mgr.issue(sid)
+        server_ts = struct.pack("!Q", int(time.time() * 1000))
+        ack = common.pack_header(
+            pkt_type=common.TYPE_RESUME_ACK,
+            seq=hdr.get("seq", 0),
+            session_id=sid,
+            transport=transport,
+        ) + new_token + server_ts
+
+        if self.obfs:
+            ack = common.salamander(ack, self.seed)
+        try:
+            tx_sock.sendto(ack, addr)
+            log.info(f"[resume] accepted sid={sid} addr={addr}")
+        except Exception:
+            pass
 
     def _send_tunnel_payload(self, payload: bytes, sess: Session):
         if sess.addr is None:

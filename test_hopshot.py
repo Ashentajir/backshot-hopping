@@ -8,10 +8,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import common, fec as fecmod, brutal
 import client as clientmod
-from client import probe_port, HopShotClient, PROFILE_PRESETS, apply_profile_overrides
+from client import probe_port, HopShotClient, PROFILE_PRESETS, apply_profile_overrides, build_network_recommendation
 from http3_masq import HTTP3Masq
 from resolver import Resolver, _query_resolver, _build_dns_query, _parse_dns_response
-from session_resume import ResumeTokenStore, TOKEN_SIZE
+from session_resume import ResumeTokenStore, TOKEN_SIZE, SessionTokenManager
 from tunnel_codec import DataReassembler, encode_datagrams
 from version import __version__
 
@@ -34,7 +34,7 @@ def test(name, fn):
 # ── Mini server helper ────────────────────────────────────────────────────────
 
 def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
-                probe_token=None, drop_every=0, loss_pct=0):
+                probe_token=None, drop_every=0, loss_pct=0, feedback_kbps=1000):
     """Returns (run_obj, received_list). run_obj.alive=False to stop."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -45,6 +45,7 @@ def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
     data_seen = 0
     pkt_seen = 0
     fec_k = fec_m = 4
+    token_mgr = SessionTokenManager(seed)
 
     def should_drop(pkt_idx: int) -> bool:
         if drop_every and pkt_idx % drop_every == 0:
@@ -70,10 +71,17 @@ def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
                 if hdr["type"] == common.TYPE_PROBE:
                     rep = common.pack_header(common.TYPE_PROBE_REPLY,
                           seq=hdr["seq"], session_id=hdr["session_id"])
-                    if probe_token is not None:
-                        rep += probe_token
+                    token = probe_token if probe_token is not None else token_mgr.issue(hdr["session_id"])
+                    rep += token + struct.pack("!Q", int(time.time() * 1000))
                     if obfs: rep = common.salamander(rep, seed)
                     sock.sendto(rep, addr)
+                elif hdr["type"] == common.TYPE_RESUME:
+                    if len(payload) >= TOKEN_SIZE and token_mgr.verify(payload[:TOKEN_SIZE], hdr["session_id"]):
+                        ack = common.pack_header(common.TYPE_RESUME_ACK, seq=hdr["seq"], session_id=hdr["session_id"])
+                        ack += token_mgr.issue(hdr["session_id"]) + struct.pack("!Q", int(time.time() * 1000))
+                        if obfs:
+                            ack = common.salamander(ack, seed)
+                        sock.sendto(ack, addr)
                 elif hdr["type"] == common.TYPE_DATA:
                     data_seen += 1
                     orig_len   = struct.unpack_from("!I", payload)[0]
@@ -89,8 +97,8 @@ def mini_server(port, obfs=False, seed=b"test-seed", jitter=64,
                                 rec = fecmod.reconstruct_data(g["s"], fec_k, fec_m, g["ol"])
                                 g["done"] = True
                                 received.append(rec)
-                                # Send Brutal CC feedback: 1000kbps, 0.5ms RTT, 0% loss
-                                bw_payload = common.pack_bw_feedback(1000, 0.5, 0.0)
+                                # Send Brutal CC feedback after reconstruction.
+                                bw_payload = common.pack_bw_feedback(int(feedback_kbps), 1, 0)
                                 fb_hdr = common.pack_header(common.TYPE_BW_FEEDBACK, seq=0, session_id=hdr["session_id"])
                                 fb_pkt = fb_hdr + bw_payload
                                 if obfs:
@@ -251,6 +259,25 @@ def t_profile_overrides():
     assert cfg["keepalive_interval_sec"] == 20
     assert set(PROFILE_PRESETS) == {"balanced", "reliable", "stealth", "throughput"}
 test("profile presets map to safe operator modes", t_profile_overrides)
+
+def t_diag_recommend_udp_quic_when_bypass():
+    rec = build_network_recommendation(
+        tcp_tls_clear=False,
+        udp_throttled=True,
+        udp_port_hopping_bypassed=True,
+    )
+    assert rec["Protocol"] == "UDP-QUIC"
+    assert rec["Port-Hopping"] is True
+test("diagnostic recommendation prefers UDP-QUIC after hopping recovery", t_diag_recommend_udp_quic_when_bypass)
+
+def t_diag_recommend_tcp_tls_when_udp_bad():
+    rec = build_network_recommendation(
+        tcp_tls_clear=True,
+        udp_throttled=True,
+        udp_port_hopping_bypassed=False,
+    )
+    assert rec["Protocol"] == "TCP-TLS"
+test("diagnostic recommendation falls back to TCP-TLS when UDP degraded", t_diag_recommend_tcp_tls_when_udp_bad)
 
 def t_version_format():
     parts = __version__.split(".")
@@ -608,6 +635,58 @@ def t_reactive_probe_classifies():
     assert isinstance(should_hop, bool)
 test("reactive probe classifies low-loss port correctly", t_reactive_probe_classifies)
 
+def t_resume_roundtrip_ack():
+    port = 19450 + random.randint(0, 80)
+    srv, _ = mini_server(port)
+    time.sleep(0.05)
+
+    c = HopShotClient(base_cfg(port, jitter_bytes=0))
+    c.start()
+    token = c._resume_store.get()
+    c.stop()
+
+    assert token is not None and len(token) == TOKEN_SIZE
+    sid = struct.unpack_from("!H", token)[0]
+
+    c2 = HopShotClient(base_cfg(port, jitter_bytes=0, resume_token=token.hex()))
+    try:
+        ok = c2._try_resume()
+        assert ok is True
+        assert c2.session_id == sid
+    finally:
+        c2.stop()
+        srv.alive = False
+test("resume token handshake returns RESUME_ACK", t_resume_roundtrip_ack)
+
+def t_start_uses_resume_and_skips_probe():
+    port = 19490 + random.randint(0, 80)
+    srv, _ = mini_server(port)
+    time.sleep(0.05)
+
+    seed_cfg = base_cfg(port, jitter_bytes=0)
+    c = HopShotClient(seed_cfg)
+    c.start()
+    token = c._resume_store.get()
+    c.stop()
+    assert token is not None
+
+    original_probe = clientmod.probe_port
+    def fail_probe(*args, **kwargs):
+        raise AssertionError("probe must be skipped when resume succeeds")
+
+    c2 = None
+    clientmod.probe_port = fail_probe
+    try:
+        c2 = HopShotClient(base_cfg(port, jitter_bytes=0, resume_token=token.hex()))
+        c2.start()
+        assert c2._resume_used is True
+    finally:
+        if c2 is not None:
+            c2.stop()
+        clientmod.probe_port = original_probe
+        srv.alive = False
+test("startup skips probe when valid resume token is available", t_start_uses_resume_and_skips_probe)
+
 # ── 13. End-to-end ───────────────────────────────────────────────────────────
 print("\n[ End-to-End ]")
 
@@ -725,6 +804,26 @@ def t_e2e_nuclear():
     c.stop(); srv.alive=False
     assert rx and rx[0]==msg
 test("NUCLEAR mode: 8x burst, data delivered", t_e2e_nuclear)
+
+def t_brutal_cc_feedback_roundtrip_changes_rate():
+    port = 19700 + random.randint(0, 50)
+    srv, rx = mini_server(port, jitter=0, feedback_kbps=5000)
+    time.sleep(0.05)
+    c = HopShotClient(base_cfg(port, jitter_bytes=0, rand_src_port=False))
+    c.start()
+    try:
+        initial = c.cc.rate_kbps
+        # Send a few packets to give feedback round-trip time to apply.
+        for i in range(5):
+            c.send(f"cc-feedback-{i}".encode())
+            time.sleep(0.15)
+        time.sleep(0.8)
+        assert c.cc.rate_kbps > initial, (initial, c.cc.rate_kbps)
+        assert rx, "server did not reconstruct any payload during CC feedback test"
+    finally:
+        c.stop()
+        srv.alive = False
+test("Brutal CC rate changes after BW feedback round-trip", t_brutal_cc_feedback_roundtrip_changes_rate)
 
 def t_loss_sweep_reachability_to_98pct():
     # Increasing loss ladder to represent progressively worse links.

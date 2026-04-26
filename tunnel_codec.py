@@ -63,12 +63,21 @@ def encode_datagrams(
 
 
 class DataReassembler:
-    def __init__(self, fec_k: int, fec_m: int, jitter: int):
+    def __init__(self, fec_k: int, fec_m: int, jitter: int, group_ttl_sec: float = 30.0):
         self.fec_k = fec_k
         self.fec_m = fec_m
         self.jitter = jitter
+        self._group_ttl_sec = max(1.0, float(group_ttl_sec))
         self._groups: Dict[int, dict] = {}
         self._lock = threading.Lock()
+
+    def _cleanup_stale_groups(self, now: float) -> None:
+        stale = [
+            seq for seq, grp in self._groups.items()
+            if (now - grp["ts"]) > self._group_ttl_sec
+        ]
+        for seq in stale:
+            self._groups.pop(seq, None)
 
     def push(self, hdr: dict, payload: bytes) -> Optional[bytes]:
         if len(payload) < 4:
@@ -81,9 +90,18 @@ class DataReassembler:
         total = hdr["total_shards"]
 
         with self._lock:
+            now = time.time()
+            self._cleanup_stale_groups(now)
+
             grp = self._groups.get(seq)
             if grp is None:
-                grp = {"shards": [None] * total, "orig_len": orig_len, "received": 0, "delivered": False, "ts": time.time()}
+                grp = {
+                    "shards": [None] * total,
+                    "orig_len": orig_len,
+                    "received": 0,
+                    "delivered": False,
+                    "ts": now,
+                }
                 self._groups[seq] = grp
 
             if grp["delivered"] or grp["shards"][shard_idx] is not None:

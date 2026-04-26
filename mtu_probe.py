@@ -103,6 +103,8 @@ class MTUProber:
 
         # Send probes from small to large
         for probe_size in MTU_PROBE_SIZES:
+            # probe_size is reused as seq only for uniqueness/correlation;
+            # authoritative echoed size is carried in MTU_REPLY payload.
             pkt = common.build_mtu_probe(probe_size, probe_size)
             if self._obfs:
                 pkt = common.salamander(pkt, self._seed)

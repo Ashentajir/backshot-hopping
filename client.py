@@ -138,6 +138,119 @@ def render_config_summary(cfg: dict) -> str:
     return "\n".join(lines)
 
 
+def build_network_recommendation(tcp_tls_clear: bool, udp_throttled: bool, udp_port_hopping_bypassed: bool) -> dict:
+    if (not udp_throttled) or udp_port_hopping_bypassed:
+        return {
+            "Protocol": "UDP-QUIC",
+            "Port-Hopping": bool(udp_port_hopping_bypassed),
+            "Reason": "UDP flows remain stable or successfully bypass throttling via port-hopping.",
+        }
+    if tcp_tls_clear:
+        return {
+            "Protocol": "TCP-TLS",
+            "Port-Hopping": False,
+            "Reason": "UDP is degraded but TCP/TLS path is reachable.",
+        }
+    return {
+        "Protocol": "None",
+        "Port-Hopping": False,
+        "Reason": "Severe degradation detected on both UDP and TCP/TLS paths.",
+    }
+
+
+def _tcp_tls_path_check(target_ip: str, target_port: int = 443, timeout_sec: float = 2.0) -> bool:
+    try:
+        with socket.create_connection((target_ip, target_port), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
+
+
+def run_network_diagnostic(cfg: dict, target_ip: str, sni: str, duration_sec: int = 10) -> dict:
+    seed = cfg["shared_seed"].encode()
+    obfs = cfg.get("obfs", False)
+    verbose = cfg.get("verbose", False)
+    server_port = int(cfg.get("server_port", 10000))
+
+    print(f"[*] Starting Diagnostic Scan for IP: {target_ip}, SNI: {sni}")
+    print("\n[*] Loading network analysis modules...")
+
+    print("=== Module 1: TCP/TLS Path Reachability ===")
+    tcp_tls_clear = _tcp_tls_path_check(target_ip, target_port=443, timeout_sec=2.0)
+    if tcp_tls_clear:
+        print(f"[+] TCP/TLS handshake reachable on {target_ip}:443")
+    else:
+        print("[-] No TCP/TLS handshake response. Target might be down or TCP blocked.")
+
+    print("\n=== Module 2: UDP Capacity & Flow-Throttling Tester ===")
+    print(f"[*] Simulating sustained UDP burst to {target_ip} for {duration_sec} seconds...")
+    burst_count = max(40, int(duration_sec * 16))
+    burst_timeout_ms = max(2000, int(duration_sec * 1000))
+    initial = probe_port(
+        target_ip,
+        server_port,
+        count=burst_count,
+        timeout_ms=burst_timeout_ms,
+        seed=seed,
+        obfs=obfs,
+        verbose=verbose,
+    )
+    initial_loss = float(initial.get("loss_pct", 100.0))
+
+    throttle_threshold = float(cfg.get("scan_throttle_threshold_pct", 80.0))
+    recovery_threshold = float(cfg.get("scan_recovery_threshold_pct", 20.0))
+    udp_throttled = initial_loss >= throttle_threshold
+    udp_port_hopping_bypassed = False
+    recovery_port = None
+    recovery_loss = None
+
+    if udp_throttled:
+        print(f"[!] Packet loss spiked to {initial_loss:.1f}%. Flow-based UDP throttling detected.")
+        if int(cfg.get("port_max", server_port)) > int(cfg.get("port_min", server_port)):
+            min_port = int(cfg.get("port_min", server_port))
+            max_port = int(cfg.get("port_max", server_port))
+            recovery_port = random.randint(min_port, max_port)
+            if recovery_port == server_port and max_port > min_port:
+                recovery_port = min_port if server_port != min_port else min_port + 1
+        else:
+            recovery_port = random.randint(max(server_port + 1, 25000), 65000)
+
+        print(f"[*] Initiating Port-Hopping Test. Switching UDP burst to random high port: {recovery_port}")
+        recovery = probe_port(
+            target_ip,
+            recovery_port,
+            count=max(20, int(burst_count / 2)),
+            timeout_ms=max(1500, int(burst_timeout_ms / 2)),
+            seed=seed,
+            obfs=obfs,
+            verbose=verbose,
+        )
+        recovery_loss = float(recovery.get("loss_pct", 100.0))
+        udp_port_hopping_bypassed = recovery.get("received", 0) > 0 and recovery_loss < recovery_threshold
+        if udp_port_hopping_bypassed:
+            print(f"[+] Packet loss recovered ({recovery_loss:.1f}%). Throttling bypassed via Port-Hopping.")
+        else:
+            print(f"[-] Packet loss remains high ({recovery_loss:.1f}%).")
+    else:
+        print(f"[+] UDP flow stable (loss={initial_loss:.1f}%).")
+
+    print("\n=== Module 3: Automated Diagnostic Report ===")
+    recommendation = build_network_recommendation(tcp_tls_clear, udp_throttled, udp_port_hopping_bypassed)
+    print("\nFINAL RECOMMENDATION:")
+    print(json.dumps(recommendation, indent=2))
+    print("\n--- Scan Finished ---")
+
+    return {
+        "tcp_tls_clear": tcp_tls_clear,
+        "udp_throttled": udp_throttled,
+        "udp_port_hopping_bypassed": udp_port_hopping_bypassed,
+        "initial_loss_pct": initial_loss,
+        "recovery_port": recovery_port,
+        "recovery_loss_pct": recovery_loss,
+        "recommendation": recommendation,
+    }
+
+
 # ─── Port prober (also used by resolver.py) ───────────────────────────────────
 
 def probe_port(server_ip, port, count=20, timeout_ms=2000,
@@ -350,6 +463,19 @@ class HopShotClient:
 
         # 0-RTT session resumption (TUIC-style)
         self._resume_store = ResumeTokenStore()
+        self._resume_used = False
+        resume_token_hex = str(cfg.get("resume_token", "") or "").strip()
+        if resume_token_hex:
+            try:
+                token = bytes.fromhex(resume_token_hex)
+                if len(token) == TOKEN_SIZE:
+                    self._resume_store.store(token)
+                    self.session_id = struct.unpack_from("!H", token)[0]
+                elif self.verbose:
+                    log.debug(f"[resume] ignored invalid token size={len(token)}")
+            except ValueError:
+                if self.verbose:
+                    log.debug("[resume] ignored invalid hex token")
 
         # Selective ARQ
         self._arq         = fecmod.SelectiveARQ(k=self.fec_k, m=self.fec_m)
@@ -465,18 +591,33 @@ class HopShotClient:
     def start(self):
         self._running = True
         if self.verbose:
-            log.debug("[client] startup phase=probe")
+            log.debug("[client] startup phase=resume/probe")
 
-        # Phase 1: probe primary port
-        result = probe_port(
-            self.primary_ip, self.server_port,
-            count      = self.cfg.get("probe_count", 20),
-            timeout_ms = self.cfg.get("probe_timeout_ms", 2000),
-            seed       = self.seed,
-            obfs       = self.obfs,
-            resume_store=self._resume_store,
-            verbose    = self.verbose,
-        )
+        result = None
+        if self._resume_store.has_token:
+            self._resume_used = self._try_resume()
+            self._record_metric("resume", ok=self._resume_used)
+
+        # Phase 1: probe primary port (unless 0-RTT resume succeeded)
+        if not self._resume_used:
+            result = probe_port(
+                self.primary_ip, self.server_port,
+                count      = self.cfg.get("probe_count", 20),
+                timeout_ms = self.cfg.get("probe_timeout_ms", 2000),
+                seed       = self.seed,
+                obfs       = self.obfs,
+                resume_store=self._resume_store,
+                verbose    = self.verbose,
+            )
+        else:
+            result = {
+                "port": self.server_port,
+                "loss_pct": 0.0,
+                "rtt_ms": 0.0,
+                "sent": 0,
+                "received": 0,
+                "clock_offset_ms": self.clock_offset_ms,
+            }
         if self.verbose:
             log.debug(f"[client] probe result: {result}")
         self._record_metric("probe", **result)
@@ -549,6 +690,62 @@ class HopShotClient:
             f"| preemptive={self.preemptive}ms | keepalive={self.keepalive_interval_sec}s"
         )
         self._record_metric("ready", hop_ms=self.hop_ms, burst_mult=self.burst_mult)
+
+    def _try_resume(self) -> bool:
+        token = self._resume_store.get()
+        if not token or len(token) != TOKEN_SIZE:
+            return False
+
+        sid = struct.unpack_from("!H", token)[0]
+        self.session_id = sid
+        seq = 0
+        pkt = common.pack_header(
+            pkt_type=common.TYPE_RESUME,
+            seq=seq,
+            session_id=sid,
+            transport=common.TRANSPORT_RAW,
+        ) + token
+        if self.obfs:
+            pkt = common.salamander(pkt, self.seed)
+
+        timeout = 0.8
+        old_timeout = self._udp_sock.gettimeout()
+        self._udp_sock.settimeout(timeout)
+        send_wall_ms = int(time.time() * 1000)
+        try:
+            for _ in range(2):
+                try:
+                    self._udp_sock.sendto(pkt, (self.primary_ip, self.server_port))
+                except Exception:
+                    continue
+                try:
+                    raw, _ = self._udp_sock.recvfrom(512)
+                except socket.timeout:
+                    continue
+
+                if self.obfs:
+                    raw = common.salamander(raw, self.seed)
+                hdr, payload = common.unpack_header(raw)
+                if hdr is None:
+                    continue
+                if hdr.get("type") != common.TYPE_RESUME_ACK or hdr.get("session_id") != sid:
+                    continue
+
+                if len(payload) >= TOKEN_SIZE:
+                    self._resume_store.store(payload[:TOKEN_SIZE])
+                if len(payload) >= TOKEN_SIZE + 8:
+                    server_ts = struct.unpack_from("!Q", payload, TOKEN_SIZE)[0]
+                    recv_wall_ms = int(time.time() * 1000)
+                    midpoint_ms = int((send_wall_ms + recv_wall_ms) / 2)
+                    self.clock_offset_ms = int(server_ts - midpoint_ms)
+                log.info(f"[resume] 0-RTT accepted sid={sid}")
+                return True
+        finally:
+            self._udp_sock.settimeout(old_timeout)
+
+        if self.verbose:
+            log.debug("[resume] no valid RESUME_ACK; falling back to probe")
+        return False
 
     def _set_mode(self, loss_pct: float):
         with self._mode_lock:
@@ -897,7 +1094,11 @@ class HopShotClient:
                     log.exception(f"[tunnel] rx loop: {e}")
 
     def _tunnel_tx_loop(self):
-        """Read IP packets from TUN device and feed them through the full send pipeline."""
+        """Read IP packets from TUN device and send via tunnel payload path.
+
+        Tunnel mode bypasses per-packet reactive probing because probe-before-send
+        on every IP packet becomes prohibitively expensive for sustained traffic.
+        """
         if self._tunnel is None:
             return
         while self._running:
@@ -905,9 +1106,7 @@ class HopShotClient:
                 pkt = self._tunnel.read(65535)
                 if not pkt:
                     continue
-                # Feed tunnel packets through the FULL send pipeline:
-                # reactive probe -> FEC -> burst -> hop -> obfs -> send
-                self.send(pkt)
+                self._send_tunnel_payload(pkt)
             except Exception as e:
                 if self._running and self.verbose:
                     log.exception(f"[tunnel] tx loop: {e}")
@@ -1184,6 +1383,12 @@ Examples:
                    help="Append runtime metrics as JSON lines")
     p.add_argument("--diagnose",       action="store_true",
                    help="Print the resolved config and exit")
+    p.add_argument("--network-diagnose", action="store_true",
+                   help="Run TCP/UDP diagnostic scan and print protocol recommendation")
+    p.add_argument("--diagnose-sni", default="vercel.com",
+                   help="SNI label shown in diagnostic report context")
+    p.add_argument("--diagnose-duration", type=int, default=10,
+                   help="Diagnostic UDP burst duration in seconds")
     p.add_argument("--msg",             default=None,
                    help="Single message to send and exit")
     p.add_argument("-v", "--verbose",   action="store_true")
@@ -1258,6 +1463,16 @@ Examples:
 
     if args.diagnose:
         print(render_config_summary(cfg))
+        return
+
+    if args.network_diagnose:
+        resolver = Resolver(cfg.get("resolvers", DEFAULT_RESOLVERS))
+        target = cfg["destinations"][0]
+        ips = resolver.resolve_all([target])
+        if not ips:
+            print(f"[-] Failed to resolve destination: {target}")
+            return
+        run_network_diagnostic(cfg, ips[0], args.diagnose_sni, duration_sec=args.diagnose_duration)
         return
 
     use_color = supports_color()
