@@ -307,6 +307,9 @@ class HopShotClient:
         self.tunnel_route_default = cfg.get("tunnel_route_default", False)
         self._transport_sock = None
         self._transport_lock = threading.Lock()
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_sock.bind(("0.0.0.0", int(cfg.get("local_port", 0) or 0)))
+        self._udp_sock.settimeout(1.0)
         self._tunnel = None
         self._tunnel_rx = None
         self._tunnel_assembler = DataReassembler(self.fec_k, self.fec_m, self.jitter)
@@ -529,7 +532,9 @@ class HopShotClient:
         self._connect_quic()
 
         # Background loops
-        threading.Thread(target=self._feedback_listener, daemon=True).start()
+        # Non-tunnel mode receives BW feedback on the stable raw UDP socket.
+        if self._tunnel is None:
+            threading.Thread(target=self._feedback_listener, daemon=True).start()
         threading.Thread(target=self._monitor_loop,      daemon=True).start()
         if self.keepalive_interval_sec > 0:
             threading.Thread(target=self._heartbeat_loop, daemon=True).start()
@@ -776,7 +781,10 @@ class HopShotClient:
                 )
 
             try:
-                if sock is None:
+                if sock is None and not self.rand_src:
+                    out_sock = self._transport_sock if self._transport_sock is not None else self._udp_sock
+                    out_sock.sendto(pkt, (dest_ip, dst_port))
+                elif sock is None:
                     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                     if self.rand_src and src_port:
                         try:
@@ -939,9 +947,7 @@ class HopShotClient:
 
     def _feedback_listener(self):
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.bind(("0.0.0.0", 0))
-            sock.settimeout(1.0)
+            sock = self._udp_sock
         except Exception as e:
             log.warning(f"[BrutalCC] listener init: {e}")
             return
@@ -1024,6 +1030,11 @@ class HopShotClient:
         self._running = False
         if self.quic:
             self.quic.close()
+        if self._udp_sock:
+            try:
+                self._udp_sock.close()
+            except Exception:
+                pass
         if self._transport_sock:
             try:
                 self._transport_sock.close()

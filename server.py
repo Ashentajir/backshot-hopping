@@ -191,6 +191,7 @@ class HopShotServer:
                 args=(extra_sock, f"extra-{idx}"),
                 daemon=True,
             ).start()
+        threading.Thread(target=self._feedback_loop, daemon=True).start()
         threading.Thread(target=self._cleanup_loop,  daemon=True).start()
         if self._tunnel is not None:
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()

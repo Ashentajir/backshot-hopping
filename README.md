@@ -24,7 +24,7 @@ HopShot runs a client and a server that exchange UDP traffic through a configura
 
 ### Requirements
 
-- Python 3.12 or newer
+- Python 3.10 or newer
 - Windows, Linux, or macOS
 - A local or remote UDP-capable server
 - Optional admin/root privileges for firewall or port redirection setup
@@ -122,6 +122,7 @@ Do not keep the example `shared_seed` value in production configs. Use `python d
 
 ### Release CLI
 
+```bash
 python server.py --version
 python client.py --diagnose --server 127.0.0.1 --dest 127.0.0.1
 python server.py --diagnose
@@ -138,32 +139,32 @@ This is the recommended server flow (validated with `deploy.py server --prepare-
 python deploy.py server --prepare-only
 ```
 
-3. Generate a fresh shared seed and apply it to both local configs:
+1. Generate a fresh shared seed and apply it to both local configs:
 
 ```bash
 python deploy.py genkey
 ```
 
-4. Edit `server.config.json` for your environment.
+1. Edit `server.config.json` for your environment.
 : Minimum fields to check: `listen_port`, `quic_port`, `port_min`, `port_max`, `shared_seed`, `max_ping_ms`, `log_file`.
 
-5. Validate resolved server config before launching:
+1. Validate resolved server config before launching:
 
 ```bash
 python deploy.py server --diagnose
 ```
 
-6. Open firewall/NAT for UDP listener ports.
+1. Open firewall/NAT for UDP listener ports.
 : At minimum open `listen_port` and your hop range (`port_min`..`port_max`).
 : If QUIC is enabled in your deployment, open `quic_port` too.
 
-7. Start the server:
+1. Start the server:
 
 ```bash
 python deploy.py server
 ```
 
-8. Verify runtime:
+1. Verify runtime:
 : Confirm startup logs show listener ports and transport options.
 : Check `server.log` (or your configured log file) for incoming probes/data.
 
@@ -224,12 +225,14 @@ python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
 HopShot includes bidirectional TUN/TAP support for tunneling arbitrary IP traffic:
 
 **Client side:**
+
 - Applications write IP packets to the TUN device (e.g., `ping`, traffic to a tunnel endpoint)
 - `_tunnel_tx_loop()` reads these packets → feeds them through the full send pipeline (reactive probe → FEC encoding → burst → port hopping → obfuscation → send)
 - Server receives, reconstructs via FEC, and writes to its TUN device
 - Server applications read the reconstructed packets and send responses back
 
 **Server side:**
+
 - Applications or local traffic write responses to the server's TUN device
 - `_tunnel_tx_loop()` reads these packets → encodes with FEC → sends back to client through hopping ports
 - Client receives on hopping ports → reconstructs via FEC → writes to client TUN device
@@ -259,6 +262,7 @@ The tunnel integrates with the full adaptive pipeline: packets automatically hop
 ### Roadmap / remaining gaps
 
 None identified. Full feature set complete:
+
 - ✅ Adaptive port hopping with loss-based mode classification
 - ✅ FEC Reed-Solomon error correction (4k+4m shards)
 - ✅ Brutal CC bandwidth feedback and pacing
@@ -275,9 +279,11 @@ None identified. Full feature set complete:
 - `common.py` - packet headers, hopping, and shared helpers
 - `tun_transport.py` - cross-platform TUN/TAP device helpers
 - `tunnel_codec.py` - shared packet encode/decode helpers for tunnel mode
+
 ## فارسی
 
 ### این پروژه چه کاری انجام می‌دهد
+
 ### ویژگی‌ها
 
 - پرش تطبیقی پورت
@@ -292,7 +298,7 @@ None identified. Full feature set complete:
 
 ### پیش‌نیازها
 
-- Python 3.14 یا جدیدتر
+- Python 3.10 یا جدیدتر
 - ویندوز، لینوکس یا macOS
 - یک سرور UDP در دسترس
 - در صورت نیاز، دسترسی admin/root برای باز کردن یا redirect کردن پورت‌ها

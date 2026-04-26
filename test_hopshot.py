@@ -343,7 +343,7 @@ test("rate clamped within [MIN, MAX] kbps", t_cc_clamp)
 def t_cc_receiver_loss():
     r=brutal.BrutalReceiver()
     for i in [0,1,2,3,4,7,8,9]: r.on_packet(i,500)
-    time.sleep(0.1)
+    time.sleep(brutal.FEEDBACK_INTERVAL + 0.02)
     fb=r.feedback()
     assert fb and fb[2]>0
 test("receiver detects seq gaps as loss%", t_cc_receiver_loss)
@@ -351,7 +351,7 @@ test("receiver detects seq gaps as loss%", t_cc_receiver_loss)
 def t_cc_receiver_rate():
     r=brutal.BrutalReceiver()
     for i in range(20): r.on_packet(i,1000)
-    time.sleep(0.1)
+    time.sleep(brutal.FEEDBACK_INTERVAL + 0.02)
     fb=r.feedback()
     assert fb and fb[0]>0
 test("receiver measures recv rate > 0", t_cc_receiver_rate)
@@ -360,10 +360,22 @@ def t_cc_receiver_down_ceiling():
     r=brutal.BrutalReceiver(declared_down_kbps=1200)
     for i in range(20):
         r.on_packet(i,50000)
-    time.sleep(0.1)
+    time.sleep(brutal.FEEDBACK_INTERVAL + 0.02)
     fb=r.feedback()
     assert fb and fb[0] <= 1200
 test("receiver caps reported rate to declared_down_kbps", t_cc_receiver_down_ceiling)
+
+def t_cc_feedback_interval_cadence():
+    r=brutal.BrutalReceiver()
+    for i in range(5):
+        r.on_packet(i,1000)
+    # Before FEEDBACK_INTERVAL has elapsed, no feedback should be emitted.
+    time.sleep(max(0.01, brutal.FEEDBACK_INTERVAL / 2.0))
+    assert r.feedback() is None
+    time.sleep(brutal.FEEDBACK_INTERVAL)
+    fb = r.feedback()
+    assert fb and fb[0] > 0
+test("receiver feedback cadence follows FEEDBACK_INTERVAL", t_cc_feedback_interval_cadence)
 
 # ── 8. Resolver ──────────────────────────────────────────────────────────────
 print("\n[ Resolver & Custom DNS ]")

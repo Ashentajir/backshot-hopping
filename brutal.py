@@ -146,7 +146,8 @@ class BrutalReceiver:
         """
         with self._lock:
             elapsed = time.monotonic() - self._win_start
-            if elapsed < 0.05:
+            # Keep feedback cadence aligned with FEEDBACK_INTERVAL to reduce noise.
+            if elapsed < FEEDBACK_INTERVAL:
                 return None
 
             recv_kbps = int((self._bytes * 8) / (elapsed * 1000.0))
