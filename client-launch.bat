@@ -37,8 +37,10 @@ set "TUNNEL_PEER="
 set "TUNNEL_DEFAULT_ROUTE=false"
 set "TUNNEL_UDP_BIND=127.0.0.1:19090"
 set "TUNNEL_UDP_TARGET="
-set "DECLARED_UP=0"
-set "MTU=0"
+set "STARTUP_CAPACITY_SCAN=true"
+set "SCAN_THROTTLE_THRESHOLD_PCT=80.0"
+set "SCAN_RECOVERY_THRESHOLD_PCT=20.0"
+set "DECLARED_DOWN=0"
 set "FEC_K=4"
 set "FEC_M=4"
 set "PROBE_COUNT=20"
@@ -203,26 +205,38 @@ echo %C_CYAN%%C_BOLD%[ Advanced Core Menu ]%C_RESET%
 echo.
 echo   Seed: %SEED%
 echo   Declared uplink kbps: %DECLARED_UP%
+echo   Declared downlink kbps: %DECLARED_DOWN%
 echo   MTU override: %MTU%
 echo   FEC: k=%FEC_K% m=%FEC_M%
 echo   Probe count/timeout: %PROBE_COUNT% / %PROBE_TIMEOUT%
+echo   Startup capacity scan: %STARTUP_CAPACITY_SCAN%
+echo   Scan throttle threshold: %SCAN_THROTTLE_THRESHOLD_PCT%%
+echo   Scan recovery threshold: %SCAN_RECOVERY_THRESHOLD_PCT%%
 echo.
 echo %C_GREEN%1.%C_RESET% Change seed
 echo %C_GREEN%2.%C_RESET% Change declared uplink kbps
-echo %C_GREEN%3.%C_RESET% Change MTU override
-echo %C_GREEN%4.%C_RESET% Change FEC k
-echo %C_GREEN%5.%C_RESET% Change FEC m
-echo %C_GREEN%6.%C_RESET% Change probe count
-echo %C_GREEN%7.%C_RESET% Change probe timeout ms
-echo %C_GREEN%B.%C_RESET% Back
+echo %C_GREEN%3.%C_RESET% Change declared downlink kbps
+echo %C_GREEN%4.%C_RESET% Change MTU override
+echo %C_GREEN%5.%C_RESET% Change FEC k
+echo %C_GREEN%6.%C_RESET% Change FEC m
+echo %C_GREEN%7.%C_RESET% Change probe count
+echo %C_GREEN%8.%C_RESET% Change probe timeout ms
+echo %C_GREEN%9.%C_RESET% Toggle startup capacity scan
+echo %C_GREEN%A.%C_RESET% Change scan throttle threshold %%
+echo %C_GREEN%B.%C_RESET% Change scan recovery threshold %%
+echo %C_GREEN%C.%C_RESET% Back
 echo.
-choice /c 1234567B /n /m "Select an option:"
-if errorlevel 8 goto :main_menu
-if errorlevel 7 goto :change_probe_timeout
-if errorlevel 6 goto :change_probe_count
-if errorlevel 5 goto :change_fec_m
-if errorlevel 4 goto :change_fec_k
-if errorlevel 3 goto :change_mtu
+choice /c 123456789ABCB /n /m "Select an option:"
+if errorlevel 12 goto :main_menu
+if errorlevel 11 goto :change_scan_recovery_threshold
+if errorlevel 10 goto :change_scan_throttle_threshold
+if errorlevel 9 goto :toggle_startup_capacity_scan
+if errorlevel 8 goto :change_probe_timeout
+if errorlevel 7 goto :change_probe_count
+if errorlevel 6 goto :change_fec_m
+if errorlevel 5 goto :change_fec_k
+if errorlevel 4 goto :change_mtu
+if errorlevel 3 goto :change_declared_down
 if errorlevel 2 goto :change_declared_up
 if errorlevel 1 goto :change_seed
 goto :advanced_menu
@@ -510,6 +524,38 @@ if /i "%PROBE_TIMEOUT%"=="b" set "PROBE_TIMEOUT=%OLD_PROBE_TIMEOUT%" & goto :adv
 if not defined PROBE_TIMEOUT set "PROBE_TIMEOUT=%OLD_PROBE_TIMEOUT%"
 goto :advanced_menu
 
+:change_declared_down
+set "OLD_DECLARED_DOWN=%DECLARED_DOWN%"
+set /p "DECLARED_DOWN=Declared downlink kbps (B=back) [%DECLARED_DOWN%]: "
+if /i "%DECLARED_DOWN%"=="b" set "DECLARED_DOWN=%OLD_DECLARED_DOWN%" & goto :advanced_menu
+if not defined DECLARED_DOWN set "DECLARED_DOWN=%OLD_DECLARED_DOWN%"
+goto :advanced_menu
+
+:toggle_startup_capacity_scan
+choice /c YNB /n /m "Toggle startup capacity scan? (Y=yes, N=no, B=back): "
+if errorlevel 3 goto :advanced_menu
+if errorlevel 2 goto :advanced_menu
+if /i "%STARTUP_CAPACITY_SCAN%"=="true" (
+  set "STARTUP_CAPACITY_SCAN=false"
+) else (
+  set "STARTUP_CAPACITY_SCAN=true"
+)
+goto :advanced_menu
+
+:change_scan_throttle_threshold
+set "OLD_SCAN_THROTTLE_THRESHOLD_PCT=%SCAN_THROTTLE_THRESHOLD_PCT%"
+set /p "SCAN_THROTTLE_THRESHOLD_PCT=Scan throttle threshold %% (B=back) [%SCAN_THROTTLE_THRESHOLD_PCT%]: "
+if /i "%SCAN_THROTTLE_THRESHOLD_PCT%"=="b" set "SCAN_THROTTLE_THRESHOLD_PCT=%OLD_SCAN_THROTTLE_THRESHOLD_PCT%" & goto :advanced_menu
+if not defined SCAN_THROTTLE_THRESHOLD_PCT set "SCAN_THROTTLE_THRESHOLD_PCT=%OLD_SCAN_THROTTLE_THRESHOLD_PCT%"
+goto :advanced_menu
+
+:change_scan_recovery_threshold
+set "OLD_SCAN_RECOVERY_THRESHOLD_PCT=%SCAN_RECOVERY_THRESHOLD_PCT%"
+set /p "SCAN_RECOVERY_THRESHOLD_PCT=Scan recovery threshold %% (B=back) [%SCAN_RECOVERY_THRESHOLD_PCT%]: "
+if /i "%SCAN_RECOVERY_THRESHOLD_PCT%"=="b" set "SCAN_RECOVERY_THRESHOLD_PCT=%OLD_SCAN_RECOVERY_THRESHOLD_PCT%" & goto :advanced_menu
+if not defined SCAN_RECOVERY_THRESHOLD_PCT set "SCAN_RECOVERY_THRESHOLD_PCT=%OLD_SCAN_RECOVERY_THRESHOLD_PCT%"
+goto :advanced_menu
+
 :toggle_verbose
 choice /c YNB /n /m "Toggle verbose logs? (Y=yes, N=no, B=back): "
 if errorlevel 3 goto :logs_menu
@@ -599,12 +645,16 @@ set "DEST_JSON=!DEST_CLEAN:,=\",\"!"
     echo   "tunnel_udp_target": null,
   )
   echo   "declared_up_kbps": %DECLARED_UP%,
+  echo   "declared_down_kbps": %DECLARED_DOWN%,
   echo   "masquerade": %MASQ%,
   echo   "mtu": %MTU%,
   echo   "fec_k": %FEC_K%,
   echo   "fec_m": %FEC_M%,
   echo   "probe_count": %PROBE_COUNT%,
   echo   "probe_timeout_ms": %PROBE_TIMEOUT%,
+  echo   "startup_capacity_scan": %STARTUP_CAPACITY_SCAN%,
+  echo   "scan_throttle_threshold_pct": %SCAN_THROTTLE_THRESHOLD_PCT%,
+  echo   "scan_recovery_threshold_pct": %SCAN_RECOVERY_THRESHOLD_PCT%,
   echo   "destinations": ["!DEST_JSON!"],
   echo   "resolvers": ["1.1.1.1"],
   echo   "verbose": %VERBOSE%,
