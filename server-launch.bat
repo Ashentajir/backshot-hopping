@@ -8,6 +8,7 @@ title HopShot Server Launcher
 cls
 echo ==================================================
 echo   HopShot Server Launcher
+echo   easy deploy  ^|  adaptive relay  ^|  proxy ready
 echo ==================================================
 echo.
 echo 1. Easy setup ^+ start server (recommended)
@@ -15,8 +16,11 @@ echo 2. Easy setup only (no start)
 echo 3. Diagnose server config
 echo 4. Generate shared seed for server/client configs
 echo 5. Start server (normal)
-echo 6. Edit server config (service_mode/proxy/health)
+echo 6. Edit server config (service_mode / tunnel / proxy / adaptive)
 echo X. Exit
+echo.
+echo Tip: use option 1 first for a ready-to-run server config.
+echo Tip: option 6 opens `server.config.json` for quick tuning.
 echo.
 choice /c 123456X /n /m "Select an option: "
 if errorlevel 7 goto :end
@@ -40,6 +44,8 @@ goto :main
 :easy_start
 call :resolve_python
 if errorlevel 1 goto :main
+echo.
+echo Launching easy server setup...
 call %PYTHON_LAUNCHER% deploy.py server --easy --config server.config.json
 if errorlevel 1 pause
 goto :main
@@ -47,6 +53,8 @@ goto :main
 :easy_prepare
 call :resolve_python
 if errorlevel 1 goto :main
+echo.
+echo Preparing adaptive server config...
 call %PYTHON_LAUNCHER% deploy.py server --easy --prepare-only --config server.config.json
 if errorlevel 1 pause
 pause
@@ -55,6 +63,8 @@ goto :main
 :diagnose
 call :resolve_python
 if errorlevel 1 goto :main
+echo.
+echo Diagnosing server config...
 call %PYTHON_LAUNCHER% deploy.py server --easy --diagnose --prepare-only --config server.config.json
 if errorlevel 1 pause
 pause
@@ -63,6 +73,8 @@ goto :main
 :genkey
 call :resolve_python
 if errorlevel 1 goto :main
+echo.
+echo Generating new shared seed...
 call %PYTHON_LAUNCHER% deploy.py genkey
 if errorlevel 1 pause
 pause
@@ -71,6 +83,8 @@ goto :main
 :start_normal
 call :resolve_python
 if errorlevel 1 goto :main
+echo.
+echo Starting server with existing config...
 call %PYTHON_LAUNCHER% deploy.py server --config server.config.json
 if errorlevel 1 pause
 goto :main

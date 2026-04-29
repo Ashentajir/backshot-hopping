@@ -1275,6 +1275,14 @@ def main():
     configure_logging(args.verbose, log_file=cfg.get("log_file"), json_logs=cfg.get("json_logs", False))
 
     use_color = supports_color()
+    tunnel_mode = str(cfg.get("tunnel_mode", "off") or "off").strip().lower()
+    service_mode = str(cfg.get("service_mode", "tunnel") or "tunnel").strip().lower()
+    if service_mode == "proxy":
+        readiness_hint = "proxy-ready -> accepts proxy opens on demand"
+    elif tunnel_mode == "off":
+        readiness_hint = "tunnel-ready -> enables on-demand UDP backend when clients request it"
+    else:
+        readiness_hint = f"tunnel-ready -> backend={cfg.get('tunnel_backend', 'off')}"
     print("\n".join([
         title(f"HopShot Server v{__version__}", "cyan", use_color=use_color),
         section_header("Listener", "cyan", use_color=use_color),
@@ -1283,6 +1291,7 @@ def main():
         key_value("quic", f"{cfg['quic_port']}", value_color="blue", use_color=use_color),
         key_value("health", f"{cfg.get('health_port', 10002)}", value_color="cyan", use_color=use_color),
         key_value("port-range", f"{cfg['port_min']}-{cfg['port_max']}", value_color="cyan", use_color=use_color),
+        key_value("readiness", readiness_hint, value_color="green", use_color=use_color),
         "",
         section_header("Transport", "blue", use_color=use_color),
         key_value("obfs", "on" if cfg["obfs"] else "off", value_color="green" if cfg["obfs"] else "yellow", use_color=use_color),

@@ -1,241 +1,120 @@
 # HopShot
 
-HopShot is a Python UDP tunneling prototype with adaptive port hopping, FEC, packet jitter, optional HTTP/3 masquerading, Brutal CC pacing, and a release-style client/server CLI.
+HopShot is a Python UDP tunnel with adaptive port hopping, FEC, Brutal CC pacing, QUIC fallback, proxy mode, and full tunnel mode.
 
 Version: `1.0.0`
 
-## English
+## What to use
 
-### What it does
+- Use `proxy` mode when you want to point a browser or app at a proxy host and port.
+- Use `tun` or `tap` with `--tunnel-default-route` when you want the whole PC to route through HopShot like a VPN.
+- Use `udp` tunnel mode when you want a local relay path without full-device routing.
 
-HopShot runs a client and a server that exchange UDP traffic through a configurable port range. The client can probe loss, choose a profile, hop ports deterministically, and optionally use QUIC/TLS or HTTP/3 masquerading. The server receives traffic, reconstructs FEC shards, and returns feedback.
+## Quick start
 
-### Main features
-
-- Adaptive port hopping
-- FEC recovery for burst loss
-- Packet jitter to vary packet sizes
-- Optional HTTP/3 masquerading
-- Optional random source ports
-- Brutal CC pacing with declared bandwidth hints
-- Diagnostic CLI output
-- JSON log file support
-- Release version flag on both client and server
-
-### Adaptive features (new)
-
-- On-demand tunnel backend: the server will dynamically create a userspace UDP tunnel relay if a client requests tunnel traffic even when `tunnel_mode` is `off` (`adaptive_tunnel_on_demand`).
-- On-demand proxy backend: proxy relay sessions are accepted on demand even when the server was started in `tunnel` service mode (`adaptive_proxy_on_demand`).
-- Adaptive receive sizing: the server tracks observed client datagram sizes (`max_rx_datagram`) and uses that hint when re-encoding tunnel responses so fragmentation and MTU mismatches are handled gracefully.
-- Adaptive FEC/MTU reassembly: server tolerates varied client FEC parameters and low-MTU fragmentation by reassembling fragments and attempting reconstruction with flexible `k/m` values.
-- ULTRA_NUC mode (client): very high-loss mode with extended hop and high burst multipliers (90%+ loss → x10–x16 bursting).
-
-### Requirements
-
-- Python 3.10 or newer
-- Windows, Linux, or macOS
-- A local or remote UDP-capable server
-- Optional admin/root privileges for firewall or port redirection setup
-- No domain is required. You can use a raw IP address or a hostname. A domain is only useful if you want a stable name that points to the server IP.
-
-### Termux / Android
-
-HopShot also runs in Termux with the standard Python package.
+1. Create or update configs:
 
 ```bash
-pkg update
-pkg install python git
+python deploy.py server --prepare-only
+python deploy.py client
+python deploy.py genkey
+```
+
+2. Start the server:
+
+```bash
+python deploy.py server --easy
+```
+
+3. Start the client:
+
+```bash
 python deploy.py client
 ```
 
-If you are connecting to a remote server, create both configs and then set the destination IP or hostname in `client.config.json`.
+## Windows launchers
 
-### Quick start
+- `client-launch.bat` gives a menu for client deploy, proxy, and tunnel setup.
+- `server-launch.bat` gives a menu for server deploy, diagnose, seed generation, and config editing.
 
-**IMPORTANT: Always generate a new shared seed using `python deploy.py genkey` before production deployment.**
+## Client modes
 
-### One-command deployment
+### Proxy mode
 
-Use the deployment bootstrapper to install everything and create local config files:
+Set your browser or app proxy to the value shown in the client startup screen, usually:
 
-```bash
-python deploy.py server
-python deploy.py client
-python deploy.py genkey    # <- Generate a random shared_seed
+```text
+127.0.0.1:1080
 ```
 
-The first run creates the virtual environment, installs the available packages, and generates `server.config.json` or `client.config.json` from the example files if they do not already exist. Edit `server.config.json` if you want to change server settings, then rerun the same command.
+That is an app-level proxy, not a full system VPN.
 
-`python deploy.py genkey` writes a fresh cryptographically random `shared_seed` into both local config files. This replaces the example placeholder seed and ensures both client and server use the same secret key for encryption. **Without this step, both sides will use the default example seed and may conflict with other HopShot deployments.**
+### Full VPN / tunnel mode
 
-For Windows users, there is also a simple menu launcher: `client-launch.bat`. It gives you a tiny text UI, writes `client.config.json`, and then starts the client through the bootstrapper.
-For server-side Windows setup, use `server-launch.bat` for one-click easy setup/start/diagnose.
-For Linux servers, use `server-launch.sh` for the same easy menu flow, including config editing.
+To route the whole PC through HopShot, use `tun` or `tap` and enable `--tunnel-default-route`:
 
 ```bash
-chmod +x server-launch.sh
-./server-launch.sh
-```
-
-#### 1. Server (Manual)
-
-```bash
-python server.py --port 10000 --seed "my-secret"
-```
-
-For a more complete deployment:
-
-```bash
-python server.py --port 10000 --quic-port 10001 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --json-logs --log-file server.log
-```
-
-#### 2. Client (Manual)
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret"
-```
-
-For an operator-style setup:
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
-  --profile balanced --json-logs --log-file client.log
-```
-
-If you prefer a domain name instead of an IP, set `--server` to the domain or put the domain in `client.config.json`. It is optional; the client works fine with a direct IP address.
-
-### Client profiles
-
-- `balanced`: general-purpose default
-- `reliable`: uses a slow fixed hop plus keepalive packets for lossy single-port environments
-- `stealth`: enables stronger camouflage options
-- `throughput`: keeps the path simpler for maximum delivery
-
-### Tunnel mode
-
-HopShot can also bridge a local TUN or TAP device for real packet forwarding. On Windows, the tunnel backend uses Wintun, so TAP requests are mapped to TUN because Windows does not expose a native TAP backend here.
-
-```bash
-# Client side
 python client.py --server 1.2.3.4 --seed "my-secret" \
   --tunnel-mode tun --tunnel-iface hopshot0 \
   --tunnel-address 10.7.0.2/30 --tunnel-peer 10.7.0.1 \
   --tunnel-default-route
-
-# Server side
-python server.py --seed "my-secret" \
-  --tunnel-mode tun --tunnel-iface hopshot0 \
-  --tunnel-address 10.7.0.1/30
 ```
 
-Real-world checklist for TUN mode:
+When that is active, external sites should see the server exit IP, assuming the server has outbound internet access.
 
-- Use matching /30 endpoints (for example client `10.7.0.2/30`, server `10.7.0.1/30`).
-- Set client `--tunnel-peer` to the server tunnel IP.
-- Enable `--tunnel-default-route` on the client when you want browser/system traffic to traverse HopShot.
-- Keep server `--tunnel-default-route` disabled unless this host should also route all outbound traffic via its tunnel interface.
-- Run with elevated privileges (Linux root for `/dev/net/tun` and route changes, Windows Administrator for Wintun/IP routing).
+### Userspace UDP relay mode
 
-### Userspace UDP relay mode (alternative to TUN/TAP)
+`udp` tunnel mode is a local relay path only. It is useful when TUN/TAP is not available, but it does not redirect the whole PC.
 
-If TUN/TAP is unavailable, run both sides with `--tunnel-mode udp`.
-This uses a local UDP relay socket on each side and still goes through the
-same FEC + hopping + obfuscation pipeline.
+## Server deployment guide
 
-```bash
-# Client side
-python client.py --server 1.2.3.4 --seed "my-secret" \
-  --tunnel-mode udp \
-  --tunnel-udp-bind 127.0.0.1:19090 \
-  --tunnel-udp-target 127.0.0.1:19091
-
-# Server side
-python server.py --seed "my-secret" \
-  --tunnel-mode udp \
-  --tunnel-udp-bind 127.0.0.1:19091 \
-  --tunnel-udp-target 127.0.0.1:19090
-```
-
-Without `--tunnel-udp-target`, each side will send return traffic to the most
-recent local UDP source that wrote into the relay socket.
-
-TUN/TAP mode requires Linux root privileges plus `iproute2`, or Wintun on Windows (for Windows run the CLI with administrator rights). Userspace UDP relay mode (`--tunnel-mode udp`) does not require kernel TUN/TAP privileges.
-
-### Security note
-
-Do not keep the example `shared_seed` value in production configs. Use `python deploy.py genkey` to generate a fresh seed before deployment.
-
-### Release CLI
-
-```bash
-python server.py --version
-python client.py --diagnose --server 127.0.0.1 --dest 127.0.0.1
-python server.py --diagnose
-```
-
-### Deployment on server
-
-This is the recommended server flow (validated with `deploy.py server --prepare-only` and `deploy.py server --diagnose`).
-
-Quick path (recommended):
+### Recommended quick deploy
 
 ```bash
 python deploy.py server --easy --prepare-only
 python deploy.py server --easy
 ```
 
-`--easy` normalizes server config defaults and auto-generates a strong `shared_seed` if it is still the placeholder.
+`--easy` normalizes the server config, enables adaptive defaults, and keeps the server ready for tunnel or proxy requests.
 
-Linux helper path:
+### Manual server setup
 
-```bash
-./server-launch.sh
+1. Edit `server.config.json`.
+2. Make sure these are set:
+
+```json
+{
+  "listen_port": 10000,
+  "quic_port": 10001,
+  "port_min": 10000,
+  "port_max": 65000,
+  "shared_seed": "PASTE_THE_SAME_SEED_AS_CLIENT",
+  "service_mode": "tunnel",
+  "tunnel_mode": "udp",
+  "adaptive_tunnel_on_demand": true,
+  "adaptive_proxy_on_demand": true,
+  "max_rx_datagram": 65535,
+  "keepalive_interval_sec": 15,
+  "log_file": "server.log"
+}
 ```
 
-Inside the Linux launcher, choose `Edit server config` to quickly tune settings like `listen_port`, `quic_port`, `port_min`, `port_max`, `tunnel_mode`, and logging.
-
-1. Copy the repository to the server host and enter the folder.
-2. Run a safe bootstrap first:
+3. Open firewall ports:
 
 ```bash
-python deploy.py server --prepare-only
+sudo ufw allow 10000/udp
+sudo ufw allow 10001/tcp
+sudo ufw allow 10000:65000/udp
 ```
 
-1. Generate a fresh shared seed and apply it to both local configs:
+4. If you want port hopping to work reliably on Linux, enable iptables redirect:
 
 ```bash
-python deploy.py genkey
+sudo iptables -t nat -A PREROUTING -p udp \
+  --dport 10000:65000 -j REDIRECT --to-port 10000
 ```
 
-1. Edit `server.config.json` for your environment.
-: Minimum fields to check: `listen_port`, `quic_port`, `port_min`, `port_max`, `shared_seed`, `max_ping_ms`, `log_file`.
-
-1. Validate resolved server config before launching:
-
-```bash
-python deploy.py server --diagnose
-```
-
-1. Open firewall/NAT for UDP listener ports.
-: At minimum open `listen_port` and your hop range (`port_min`..`port_max`).
-: If QUIC is enabled in your deployment, open `quic_port` too.
-
-1. Start the server:
-
-```bash
-python deploy.py server
-```
-
-1. Verify runtime:
-: Confirm startup logs show listener ports and transport options.
-: Check `server.log` (or your configured log file) for incoming probes/data.
-
-Note: if startup logs show a QUIC init warning and continue in raw UDP mode, ensure OpenSSL is installed and available in PATH so certificate generation can succeed.
-
-If the server is behind NAT or cloud security groups, make sure those rules forward/allow the same UDP ports to the host running `server.py`.
-
-#### Linux service example (systemd)
+### Run as a service
 
 ```ini
 [Unit]
@@ -253,7 +132,7 @@ RestartSec=3
 WantedBy=multi-user.target
 ```
 
-Then enable it:
+Enable it:
 
 ```bash
 sudo systemctl daemon-reload
@@ -261,259 +140,62 @@ sudo systemctl enable --now hopshot
 sudo systemctl status hopshot
 ```
 
-#### Manual run example
+## Config files
 
-```bash
-python server.py --port 10000 --quic-port 10001 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --max-ping-ms 15000 --masquerade
-```
+- `client.config.json` and `server.config.json` are the local runtime configs.
+- `client.config.example.json` and `server.config.example.json` are the safe templates.
+- Run `python deploy.py genkey` to write the same fresh `shared_seed` into both local configs.
 
-### Deployment on client
+## Troubleshooting
 
-1. Copy the repository to the client machine.
-2. Run `python deploy.py client`.
-3. Edit `client.config.json` to set the destination server and any preferred client options.
-4. Match the shared seed and port range.
-5. Rerun the same command to start the client with the saved settings.
-
-Example:
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --profile balanced
-```
-
-### TUN/TAP IP Tunneling
-
-HopShot includes bidirectional TUN/TAP support for tunneling arbitrary IP traffic:
-
-**Client side:**
-
-- Applications write IP packets to the TUN device (e.g., `ping`, traffic to a tunnel endpoint)
-- `_tunnel_tx_loop()` reads these packets → feeds them through the full send pipeline (reactive probe → FEC encoding → burst → port hopping → obfuscation → send)
-- Server receives, reconstructs via FEC, and writes to its TUN device
-- Server applications read the reconstructed packets and send responses back
-
-**Server side:**
-
-- Applications or local traffic write responses to the server's TUN device
-- `_tunnel_tx_loop()` reads these packets → encodes with FEC → sends back to client through hopping ports
-- Client receives on hopping ports → reconstructs via FEC → writes to client TUN device
-- Client applications read the reconstructed IP packets
-
-**Enable TUN mode:**
-
-```json
-{
-  "tunnel_mode": "tun",
-  "tunnel_iface": "hopshot0",
-  "tunnel_address": "10.0.0.1",
-  "tunnel_peer": "10.0.0.2",
-  "tunnel_mtu": 1400
-}
-```
-
-The tunnel integrates with the full adaptive pipeline: packets automatically hop ports, apply FEC for burst loss recovery, obfuscate if enabled, and adapt burst multipliers based on detected loss.
-
-### Logging and diagnostics
-
-- `--log-file` writes logs to a file.
-- `--json-logs` writes file logs as JSON lines.
-- `--diagnose` prints the resolved configuration and exits.
-- `--msg` sends one message and exits.
-
-### Roadmap / remaining gaps
-
-None identified. Full feature set complete:
-
-- ✅ Adaptive port hopping with loss-based mode classification
-- ✅ FEC Reed-Solomon error correction (4k+4m shards)
-- ✅ Brutal CC bandwidth feedback and pacing
-- ✅ TUN/TAP IP tunneling with bidirectional pipeline
-- ✅ HTTP/3 masquerading and packet obfuscation
-- ✅ Multi-destination failover and QUIC fallback
-- ✅ Clock skew compensation
-- ✅ Session resumption and 0-RTT probe tokens
-
-### Project layout
-
-- `client.py` - client CLI and transport pipeline
-- `server.py` - server CLI and receive pipeline
-- `common.py` - packet headers, hopping, and shared helpers
-- `tun_transport.py` - cross-platform TUN/TAP device helpers
-- `tunnel_codec.py` - shared packet encode/decode helpers for tunnel mode
+- If proxy mode works but full VPN does not, make sure you used `tun` or `tap` and enabled `--tunnel-default-route`.
+- If tunnel mode says relay only, that is expected for `udp` tunnel mode.
+- If the server does not start, check Python 3.10+, firewall rules, and `server.log`.
 
 ## فارسی
 
-### این پروژه چه کاری انجام می‌دهد
+### این پروژه چیست؟
 
-### ویژگی‌ها
+HopShot یک تونل UDP با پرش پورت تطبیقی، FEC، Brutal CC، حالت پروکسی، و حالت تونل کامل است.
 
-- پرش تطبیقی پورت
-- بازیابی خطا با FEC
-- تغییر اندازهٔ بسته‌ها برای سخت‌تر شدن fingerprint
-- ماسک‌کردن اختیاری HTTP/3
-- تصادفی‌سازی اختیاری پورت مبدأ
-- کنترل نرخ با Brutal CC
-- خروجی تشخیصی برای CLI
-- پشتیبانی از لاگ JSON
-- نمایش نسخه در کلاینت و سرور
+### کدام حالت را استفاده کنم؟
 
-### پیش‌نیازها
-
-- Python 3.10 یا جدیدتر
-- ویندوز، لینوکس یا macOS
-- یک سرور UDP در دسترس
-- در صورت نیاز، دسترسی admin/root برای باز کردن یا redirect کردن پورت‌ها
-- دامنه لازم نیست. می‌توانید از IP مستقیم یا hostname استفاده کنید. دامنه فقط وقتی مفید است که بخواهید یک نام ثابت به IP سرور وصل باشد.
+- اگر می‌خواهید فقط مرورگر یا یک برنامه را وصل کنید، از `proxy` استفاده کنید.
+- اگر می‌خواهید کل سیستم از طریق HopShot برود، از `tun` یا `tap` همراه با `--tunnel-default-route` استفاده کنید.
+- اگر TUN/TAP ندارید، `udp` فقط یک relay محلی است و VPN کامل نیست.
 
 ### راه‌اندازی سریع
 
-### استقرار یک‌مرحله‌ای
-
-برای نصب خودکار و ساخت فایل تنظیمات، این دستورها را اجرا کنید:
-
 ```bash
-python deploy.py server
+python deploy.py server --prepare-only
 python deploy.py client
+python deploy.py genkey
+python deploy.py server --easy
 ```
 
-اجرای اول، virtual environment را می‌سازد، بسته‌های موجود را نصب می‌کند، و در صورت نبودن فایل‌ها، `server.config.json` یا `client.config.json` را از نمونه‌ها ایجاد می‌کند. اگر خواستید تنظیمات سرور را تغییر دهید، فقط `server.config.json` را ویرایش کنید و همان دستور را دوباره اجرا کنید.
+### راه‌اندازی سرور
 
-برای کاربران ویندوز، یک لانچر ساده هم اضافه شده است: `client-launch.bat`. این فایل یک منوی متنی خیلی ساده نشان می‌دهد، `client.config.json` را می‌سازد، و بعد کلاینت را از طریق bootstrapper اجرا می‌کند.
+1. فایل `server.config.json` را ویرایش کنید.
+2. مطمئن شوید `shared_seed` در کلاینت و سرور یکی است.
+3. پورت‌های `10000/udp` و `10001/tcp` را باز کنید.
+4. اگر پرش پورت می‌خواهید، رنج UDP را هم باز کنید.
 
-#### 1) سرور
+### حالت VPN کامل
 
-اول سرور را اجرا کنید:
+اگر می‌خواهید IP عمومی سیستم عوض شود، این شرط‌ها لازم است:
 
-```bash
-python server.py --port 10000 --seed "my-secret"
+- `tunnel_mode` برابر `tun` یا `tap` باشد.
+- `tunnel_route_default` در کلاینت `true` باشد.
+- سرور خروجی اینترنت داشته باشد.
+
+### حالت پروکسی
+
+آدرس پروکسی را از خروجی کلاینت بردارید. معمولاً این است:
+
+```text
+127.0.0.1:1080
 ```
 
-برای حالت کامل‌تر:
+### نکته مهم
 
-```bash
-python server.py --port 10000 --quic-port 10001 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --json-logs --log-file server.log
-```
-
-#### 2) کلاینت
-
-سپس کلاینت را اجرا کنید:
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret"
-```
-
-برای استفادهٔ عملیاتی‌تر:
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
-  --profile balanced --json-logs --log-file client.log
-```
-
-اگر به‌جای IP بخواهید از دامنه استفاده کنید، کافی است `--server` را روی دامنه بگذارید یا همان را داخل `client.config.json` قرار دهید. این اختیاری است و کلاینت با IP مستقیم هم کاملاً کار می‌کند.
-
-### پروفایل‌های کلاینت
-
-- `balanced`: حالت پیش‌فرض عمومی
-- `reliable`: ساده‌تر و پایدارتر، بدون hopping
-- `stealth`: با تنظیمات مخفی‌سازی قوی‌تر
-- `throughput`: مسیر ساده‌تر برای تحویل بهتر
-
-### حالت Tunnel
-
-HopShot می‌تواند یک دستگاه Linux TUN یا TAP را برای عبور واقعی packetها bridge کند.
-
-```bash
-# سمت کلاینت
-python client.py --server 1.2.3.4 --seed "my-secret" \
-  --tunnel-mode tun --tunnel-iface hopshot0 \
-  --tunnel-address 10.7.0.2/30 --tunnel-peer 10.7.0.1 \
-  --tunnel-default-route
-
-# سمت سرور
-python server.py --seed "my-secret" \
-  --tunnel-mode tun --tunnel-iface hopshot0 \
-  --tunnel-address 10.7.0.1/30
-```
-
-این حالت به Linux، دسترسی root و `iproute2` نیاز دارد. TAP هم در کد expose شده است، ولی برای استفادهٔ درست معمولاً باید bridge یا routing خارجی هم تنظیم کنید.
-
-### دستورهای نسخه و تشخیص
-
-```bash
-python client.py --version
-python server.py --version
-python client.py --diagnose --server 127.0.0.1 --dest 127.0.0.1
-python server.py --diagnose
-```
-
-### استقرار روی سرور
-
-1. مخزن را روی ماشین سرور کپی کنید.
-2. دستور `python deploy.py server` را اجرا کنید.
-3. اگر خواستید پورت‌ها، seed یا لاگ را تغییر دهید، `server.config.json` را ویرایش کنید.
-4. پورت‌های UDP و در صورت نیاز QUIC/TLS را باز کنید.
-5. همان دستور را دوباره اجرا کنید تا سرور با تنظیمات ذخیره‌شده بالا بیاید.
-
-نمونه:
-
-```bash
-python server.py --port 10000 --quic-port 10001 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --iptables --masquerade
-```
-
-اگر سرور پشت firewall یا NAT است، باید پورت‌ها به همان ماشین forward شوند.
-
-### استقرار روی کلاینت
-
-1. مخزن را روی ماشین کلاینت کپی کنید.
-2. دستور `python deploy.py client` را اجرا کنید.
-3. `client.config.json` را ویرایش کنید تا IP یا hostname سرور و گزینه‌های دلخواه کلاینت تنظیم شوند.
-4. seed و بازهٔ پورت را با سرور هماهنگ کنید.
-5. همان دستور را دوباره اجرا کنید تا کلاینت با تنظیمات ذخیره‌شده بالا بیاید.
-
-نمونه:
-
-```bash
-python client.py --server 1.2.3.4 --port 10000 --seed "my-secret" \
-  --port-min 10000 --port-max 65000 --profile balanced
-```
-
-### لاگ و عیب‌یابی
-
-- `--log-file` لاگ را در فایل ذخیره می‌کند.
-- `--json-logs` لاگ فایل را به صورت JSON line می‌نویسد.
-- `--diagnose` تنظیمات نهایی را چاپ می‌کند و خارج می‌شود.
-- `--msg` یک پیام می‌فرستد و تمام می‌شود.
-
-### یادداشت امنیتی
-
-از مقدار نمونهٔ `shared_seed` در محیط واقعی استفاده نکنید. با `python deploy.py genkey` یک seed جدید و تصادفی بسازید.
-
-### ساختار پروژه
-
-- `deploy.py` - bootstrapper خودکار برای سرور و کلاینت
-- `server.config.example.json` - تنظیمات نمونهٔ سرور
-- `client.config.example.json` - تنظیمات نمونهٔ کلاینت
-- `requirements.txt` - فهرست نصب برای bootstrapper
-- `client.py` - CLI و مسیر ارسال کلاینت
-- `server.py` - CLI و مسیر دریافت سرور
-- `common.py` - هدر بسته‌ها و helperهای مشترک
-- `fec.py` - منطق FEC و بازیابی
-- `brutal.py` - pacing و feedback
-- `http3_masq.py` - ماسک‌کردن HTTP/3
-- `mtu_probe.py` - تشخیص MTU
-- `resolver.py` - DNS و probing مقصد
-- `session_resume.py` - کش tokenهای probe
-- `terminal_ui.py` - لاگ رنگی و formatting ترمینال
-- `tun_transport.py` - helperهای دستگاه Linux TUN/TAP
-- `tunnel_codec.py` - helperهای encode/decode برای tunnel mode
-- `test_hopshot.py` - تست‌های یکپارچه
-
-### نکته
-
-- این پروژه برای آزمایش و استقرار کنترل‌شده طراحی شده است.
-- کلاینت و سرور باید یک seed مشترک داشته باشند.
-- اگر masquerade یا iptables redirect را فعال می‌کنید، تنظیمات سمت سرور را هم انجام دهید.
+اگر `tunnel_mode=udp` باشد، فقط relay محلی فعال است و کل سیستم را تونل نمی‌کند.

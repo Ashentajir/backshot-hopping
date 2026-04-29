@@ -1,11 +1,11 @@
 # HopShot Client - Resilience Improvements
 
 ## Overview
-Enhanced the HopShot client to reliably reach servers even with unstable ping and network conditions. Added robust retry mechanisms, automatic fallback strategies, and connection health monitoring.
+This note summarizes the client-side resilience work: retries, fallback paths, and connection health monitoring.
 
 ## Key Changes
 
-### 1. **Enhanced QUIC Client with Exponential Backoff Retry** 
+### 1. **Enhanced QUIC Client with Exponential Backoff Retry**
 **File:** `quic_transport.py`
 
 #### Improvements:
@@ -124,7 +124,7 @@ else:
 
 ## Configuration Recommendations
 
-### For Unstable Networks:
+### For unstable networks:
 ```json
 {
   "profile": "reliable",
@@ -138,7 +138,7 @@ else:
 }
 ```
 
-### For Mobile Networks:
+### For mobile networks:
 ```json
 {
   "profile": "mobile",
@@ -177,13 +177,13 @@ New metrics recorded:
    iptables -A INPUT -p tcp --dport 10001 -j DROP
    ```
 
-## Summary
+## Support
 
-The enhanced client now provides enterprise-grade resilience:
-- ✅ Survives temporary network interruptions
-- ✅ Recovers from server unavailability
-- ✅ Adapts to changing network conditions
-- ✅ Maintains connection through firewall policies
-- ✅ Gracefully degrades when optimal path unavailable
+If connection issues persist:
+1. Enable verbose logging: `--verbose`
+2. Save metrics: `--metrics-file metrics.jsonl`
+3. Check firewall rules on your host
+4. Test with `--profile reliable` first
+5. Review this note for the retry and fallback behavior
 
-**Result**: Reliable connectivity even in challenging network environments!
+**Result**: the client is designed to recover automatically from temporary network interruptions.

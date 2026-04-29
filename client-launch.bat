@@ -63,6 +63,7 @@ if exist client.config.json call :load_existing_config
 cls
 echo %C_CYAN%%C_BOLD%==================================================%C_RESET%
 echo %C_CYAN%%C_BOLD%  HopShot Client Launcher%C_RESET%
+echo %C_CYAN%%C_BOLD%  fast deploy  ^|  easy proxy  ^|  full tunnel%C_RESET%
 echo %C_CYAN%%C_BOLD%==================================================%C_RESET%
 echo.
 echo %C_BOLD%Quick status:%C_RESET%
@@ -70,10 +71,32 @@ echo   %C_WHITE%Server:%C_RESET% %SERVER%   %C_WHITE%Port:%C_RESET% %PORT%   %C_
 echo   %C_WHITE%Profile:%C_RESET% %PROFILE%   %C_WHITE%Adaptive mode:%C_RESET% %ADAPTIVE_MODE%
 echo   %C_WHITE%Max ping:%C_RESET% %MAX_PING_MS%ms   %C_WHITE%Health:%C_RESET% %HEALTH_PORT%
 echo   %C_WHITE%Service:%C_RESET% %SERVICE_MODE%   %C_WHITE%Proxy listen:%C_RESET% %PROXY_LISTEN%
-echo   %C_WHITE%Tunnel:%C_RESET% %TUNNEL_MODE%   %C_WHITE%Relay:%C_RESET% %TUNNEL_UDP_BIND% -^> %TUNNEL_UDP_TARGET%
+if defined TUNNEL_UDP_TARGET (
+  echo   %C_WHITE%Tunnel:%C_RESET% %TUNNEL_MODE%   %C_WHITE%Relay:%C_RESET% %TUNNEL_UDP_BIND% -^> %TUNNEL_UDP_TARGET%
+) else (
+  echo   %C_WHITE%Tunnel:%C_RESET% %TUNNEL_MODE%   %C_WHITE%Relay:%C_RESET% %TUNNEL_UDP_BIND% -^> auto
+)
 echo   %C_WHITE%Hop disabled:%C_RESET% %DISABLE_HOP%   %C_WHITE%Fixed hop:%C_RESET% %FIXED_HOP_MS%ms   %C_WHITE%Burst:%C_RESET% %MANUAL_BURST%
 echo   %C_WHITE%Obfs/Masq/Rand:%C_RESET% %OBFS%/%MASQ%/%RAND_SRC%   %C_WHITE%Verbose/JSON:%C_RESET% %VERBOSE%/%JSON_LOGS%
 echo   %C_WHITE%FEC:%C_RESET% k=%FEC_K% m=%FEC_M%   %C_WHITE%MTU:%C_RESET% %MTU%   %C_WHITE%Jitter:%C_RESET% %JITTER%B
+echo.
+if /i "%SERVICE_MODE%"=="proxy" (
+  echo   %C_GREEN%Proxy ready:%C_RESET% set your browser/app to %PROXY_LISTEN%
+) else if /i "%TUNNEL_MODE%"=="tun" (
+  if /i "%TUNNEL_DEFAULT_ROUTE%"=="true" (
+    echo   %C_GREEN%Tunnel ready:%C_RESET% whole-PC routing enabled via %TUNNEL_IFACE%
+  ) else (
+    echo   %C_YELLOW%Tunnel ready:%C_RESET% interface up, enable default route for whole-PC VPN
+  )
+) else if /i "%TUNNEL_MODE%"=="tap" (
+  if /i "%TUNNEL_DEFAULT_ROUTE%"=="true" (
+    echo   %C_GREEN%Tunnel ready:%C_RESET% whole-PC routing enabled via %TUNNEL_IFACE%
+  ) else (
+    echo   %C_YELLOW%Tunnel ready:%C_RESET% interface up, enable default route for whole-PC VPN
+  )
+) else if /i "%TUNNEL_MODE%"=="udp" (
+  echo   %C_CYAN%Relay mode:%C_RESET% local UDP relay only, not whole-PC VPN
+)
 echo.
 echo %C_GREEN%1.%C_RESET% Start client
 echo %C_GREEN%2.%C_RESET% Network menu
@@ -711,10 +734,13 @@ goto :main_menu
 :start_client
 call :write_config
 echo.
-echo %C_CYAN%Starting HopShot client...%C_RESET%
-echo   Server  : %SERVER%:%PORT%
-echo   Profile : %PROFILE%
-echo   Seed    : %SEED%
+echo %C_CYAN%%C_BOLD%Starting HopShot client...%C_RESET%
+echo   %C_WHITE%Server:%C_RESET%   %SERVER%:%PORT%
+echo   %C_WHITE%Profile:%C_RESET%  %PROFILE%
+echo   %C_WHITE%Service:%C_RESET%  %SERVICE_MODE%
+echo   %C_WHITE%Tunnel:%C_RESET%   %TUNNEL_MODE%  %TUNNEL_IFACE%
+echo   %C_WHITE%Proxy:%C_RESET%    %PROXY_LISTEN%
+echo   %C_WHITE%Seed:%C_RESET%     %SEED%
 echo.
 call :resolve_python
 if not defined PYTHON_LAUNCHER goto :main_menu

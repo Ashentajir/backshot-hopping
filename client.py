@@ -226,6 +226,19 @@ def render_config_summary(cfg: dict) -> str:
     burst_text = f"auto (mode)" if not burst_override else f"x{burst_override}"
     adaptive_state = "on" if cfg.get("adaptive_mode", True) else "off"
     max_ping_ms = cfg.get("max_ping_ms", 15000)
+    service_mode = str(cfg.get("service_mode", "tunnel") or "tunnel").strip().lower()
+    tunnel_mode = str(cfg.get("tunnel_mode", "off") or "off").strip().lower()
+    if service_mode == "proxy":
+        deployment_hint = f"proxy deploy -> set {cfg.get('proxy_listen', '127.0.0.1:1080')}"
+    elif tunnel_mode in {"tun", "tap"}:
+        if cfg.get("tunnel_route_default", False):
+            deployment_hint = "tunnel deploy -> whole-PC routing enabled"
+        else:
+            deployment_hint = "tunnel deploy -> interface up, default route off"
+    elif tunnel_mode == "udp":
+        deployment_hint = "udp tunnel -> local relay mode"
+    else:
+        deployment_hint = "transport -> raw UDP + QUIC"
     lines = [
         title(f"HopShot Client v{__version__}", "cyan", use_color=use_color),
         section_header("Session", "cyan", use_color=use_color),
@@ -247,6 +260,7 @@ def render_config_summary(cfg: dict) -> str:
         key_value("keepalive", f"{cfg.get('keepalive_interval_sec', 0)}s", value_color="cyan", use_color=use_color),
         key_value("strategy", "udp-raw + quic (parallel)", value_color="green", use_color=use_color),
         key_value("cc", "Brutal primary, BBR backup", value_color="magenta", use_color=use_color),
+        key_value("deployment", deployment_hint, value_color="green", use_color=use_color),
         key_value("proxy-listen", cfg.get("proxy_listen") or "-", value_color="cyan", use_color=use_color),
         key_value("clock offset", f"{cfg.get('clock_offset_ms', 0)}ms", value_color="white", use_color=use_color),
         key_value("tunnel", f"{cfg.get('tunnel_mode', 'off')} / {cfg.get('tunnel_backend', 'off')}", value_color="cyan", use_color=use_color),
@@ -846,6 +860,10 @@ class HopShotClient:
         self._proxy_listener_thread = threading.Thread(target=self._proxy_accept_loop, daemon=True)
         self._proxy_listener_thread.start()
         log.info(f"[proxy] listening on {bind_addr[0]}:{bind_addr[1]} ({self.service_mode})")
+        log.info(
+            f"[proxy] set your PC/browser proxy to {bind_addr[0]}:{bind_addr[1]} "
+            "(HTTP CONNECT or SOCKS5)"
+        )
 
     def _proxy_accept_loop(self):
         while self._running and self._proxy_listener is not None:
@@ -1238,6 +1256,22 @@ class HopShotClient:
         elif self.tunnel_mode != "off" and self._transport_sock is not None:
             threading.Thread(target=self._tunnel_rx_loop, daemon=True).start()
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
+            if self.tunnel_mode in {"tun", "tap"}:
+                if self.tunnel_route_default:
+                    log.info(
+                        f"[tunnel] whole-PC routing enabled via {self.tunnel_iface}; "
+                        "system traffic will traverse HopShot"
+                    )
+                else:
+                    log.info(
+                        f"[tunnel] tunnel interface {self.tunnel_iface} is up; "
+                        "enable tunnel_route_default to route the whole PC"
+                    )
+            elif self.tunnel_mode == "udp":
+                log.info(
+                    f"[tunnel-udp] local relay active on {self.tunnel_udp_bind}; "
+                    "this mode forwards relay traffic, not the entire PC"
+                )
 
         log.info(
             f"[client] ready | mode={common.MODE_NAMES[self.mode]} "
