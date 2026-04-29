@@ -101,7 +101,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
 # ─── Shard group ──────────────────────────────────────────────────────────────
 
 class ShardGroup:
-    __slots__ = ("shards", "orig_len", "total", "received", "delivered", "ts")
+    __slots__ = ("shards", "orig_len", "total", "received", "delivered", "ts", "fragments")
 
     def __init__(self, total: int, orig_len: int):
         self.shards    = [None] * total
@@ -110,6 +110,7 @@ class ShardGroup:
         self.received  = 0
         self.delivered = False
         self.ts        = time.monotonic()
+        self.fragments = {}
 
 
 # ─── Session ──────────────────────────────────────────────────────────────────
@@ -125,6 +126,7 @@ class Session:
         self.last_seen  = time.monotonic()
         self.rx_obfs    = default_obfs
         self.rx_masq    = default_masq
+        self.rx_max_datagram = 0
         self.receiver   = brutal.BrutalReceiver(
             declared_down_kbps=declared_down_kbps
         )
@@ -192,9 +194,12 @@ class HopShotServer:
         self._tunnel_udp_sock = None
         self._proxy_relays = {}
         self._proxy_relays_lock = threading.Lock()
+        self._proxy_adaptive_ready_sessions = set()
+        self._proxy_adaptive_lock = threading.Lock()
         self._reply_wrap_seq = 0
         self._reply_wrap_lock = threading.Lock()
         self._tunnel_tx_thread_started = False
+        self.max_rx_datagram = max(2048, int(cfg.get("max_rx_datagram", 65535) or 65535))
 
         if self.tunnel_mode in {"tun", "tap"}:
             try:
@@ -259,6 +264,54 @@ class HopShotServer:
             f"[adaptive] enabled on-demand tunnel backend bind={bound[0]}:{bound[1]} "
             f"target={self._tunnel_udp_target_addr}"
         )
+
+    def _ensure_adaptive_proxy_backend(self, session_id: int | None = None) -> bool:
+        if self.service_mode == "proxy":
+            return True
+        if not bool(self.cfg.get("adaptive_proxy_on_demand", True)):
+            return False
+        sid = int(session_id or 0)
+        with self._proxy_adaptive_lock:
+            if sid and sid not in self._proxy_adaptive_ready_sessions:
+                self._proxy_adaptive_ready_sessions.add(sid)
+                log.info(f"[adaptive] enabled on-demand proxy backend sid={sid}")
+        return True
+
+    def _record_rx_datagram_hint(self, sid: int, recv_size: int, addr=None):
+        if sid <= 0 or recv_size <= 0:
+            return
+        sess = self._get_session(sid, addr)
+        if recv_size > sess.rx_max_datagram:
+            sess.rx_max_datagram = recv_size
+
+    def _reconstruct_group_adaptive(self, grp: ShardGroup) -> tuple[bytes, int, int] | None:
+        total = int(grp.total)
+        if total <= 0 or grp.orig_len < 0:
+            return None
+
+        pref_k = int(self.fec_k)
+        candidates: list[int] = []
+        for k in [pref_k, total - int(self.fec_m), max(1, total // 2)]:
+            if 1 <= k <= total and k not in candidates:
+                candidates.append(k)
+        for k in range(min(grp.received, total), 0, -1):
+            if k not in candidates:
+                candidates.append(k)
+
+        for k in candidates:
+            if grp.received < k:
+                continue
+            m = total - k
+            if m < 0:
+                continue
+            try:
+                recovered = fecmod.reconstruct_data(grp.shards, k, m, grp.orig_len)
+            except Exception:
+                continue
+            if len(recovered) != grp.orig_len:
+                continue
+            return recovered, k, m
+        return None
 
     def _reply_sockets(self, tx_sock: socket.socket | None = None) -> list[socket.socket]:
         sockets: list[socket.socket] = []
@@ -400,6 +453,9 @@ class HopShotServer:
         target = _decode_proxy_target(payload)
         stream_id = int(hdr.get("stream_id", 0) or 0)
         session_id = int(hdr.get("session_id", 0) or 0)
+        if not self._ensure_adaptive_proxy_backend(session_id):
+            self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_ERROR, b"proxy disabled by policy", addr, tx_sock=tx_sock)
+            return
         if not stream_id or not target:
             self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_ERROR, b"bad target", addr, tx_sock=tx_sock)
             return
@@ -420,6 +476,8 @@ class HopShotServer:
     def _handle_proxy_data(self, hdr: dict, payload: bytes):
         stream_id = int(hdr.get("stream_id", 0) or 0)
         session_id = int(hdr.get("session_id", 0) or 0)
+        if not self._ensure_adaptive_proxy_backend(session_id):
+            return
         key = self._proxy_key(session_id, stream_id)
         with self._proxy_relays_lock:
             relay_sock = self._proxy_relays.get(key)
@@ -433,6 +491,8 @@ class HopShotServer:
     def _handle_proxy_close(self, hdr: dict):
         stream_id = int(hdr.get("stream_id", 0) or 0)
         session_id = int(hdr.get("session_id", 0) or 0)
+        if not self._ensure_adaptive_proxy_backend(session_id):
+            return
         self._proxy_close(session_id, stream_id)
 
     # ── Startup ───────────────────────────────────────────────────────────────
@@ -556,7 +616,7 @@ class HopShotServer:
         self._udp_loop_on_socket(self.udp_sock, "primary")
 
     def _udp_loop_on_socket(self, recv_sock: socket.socket, label: str):
-        buf = bytearray(common.MAX_PACKET + 64)
+        buf = bytearray(self.max_rx_datagram + 64)
         while self._running:
             try:
                 n, addr = recv_sock.recvfrom_into(buf)
@@ -582,6 +642,7 @@ class HopShotServer:
             return
 
         self._remember_session_style(int(hdr.get("session_id", 0) or 0), addr, used_obfs, used_masq)
+        self._record_rx_datagram_hint(int(hdr.get("session_id", 0) or 0), recv_size, addr)
 
         t = hdr["type"]
         if self.verbose:
@@ -620,6 +681,7 @@ class HopShotServer:
             return
 
         self._remember_session_style(int(hdr.get("session_id", 0) or 0), None, used_obfs, False)
+        self._record_rx_datagram_hint(int(hdr.get("session_id", 0) or 0), len(data), None)
 
         hdr["transport"] = common.TRANSPORT_QUIC
         t = hdr["type"]
@@ -719,6 +781,10 @@ class HopShotServer:
             seq = self._tun_seq
 
         sess_obfs, sess_masq = self._session_style(sess.session_id)
+        mtu_hint = int(getattr(sess, "rx_max_datagram", 0) or 0)
+        max_dgram = mtu_hint if mtu_hint > 0 else int(self.tunnel_mtu or common.MAX_PACKET)
+        max_dgram = max(256, min(common.MAX_PACKET, max_dgram))
+
         encoded = encode_datagrams(
             payload=payload,
             seq=seq,
@@ -730,7 +796,7 @@ class HopShotServer:
             obfs=sess_obfs,
             masquerade=sess_masq,
             transport=common.TRANSPORT_RAW,
-            max_datagram_size=max(64, int(self.tunnel_mtu or common.MAX_PACKET)),
+            max_datagram_size=max_dgram,
             stream_id=stream_id_from_ip_packet(payload),
         )
 
@@ -794,17 +860,12 @@ class HopShotServer:
     # ── Data handler ──────────────────────────────────────────────────────────
 
     def _handle_data(self, hdr: dict, payload: bytes, addr, transport: int, tx_sock: socket.socket | None = None):
-        if len(payload) < 4:
-            if self.verbose:
-                log.debug(f"[DATA] short payload seq={hdr['seq']} len={len(payload)}")
-            return
-
-        orig_len   = struct.unpack_from("!I", payload)[0]
-        shard_data = common.strip_jitter_padding(payload[4:], max_jitter=self.jitter)
         seq        = hdr["seq"]
         shard_idx  = hdr["shard_idx"]
         total      = hdr["total_shards"]
         sid        = hdr["session_id"]
+        frag_id    = int(hdr.get("frag_id", 0) or 0)
+        frag_count = int(hdr.get("frag_count", 1) or 1)
 
         # Brutal CC measurement
         sess = self._get_session(sid, addr)
@@ -818,13 +879,13 @@ class HopShotServer:
         if self.verbose:
             log.debug(
                 f"[DATA] seq={seq} sess={sid} shard={shard_idx}/{total} "
-                f"orig_len={orig_len} payload_len={len(payload)} transport={transport}"
+                f"frag={frag_id}/{frag_count} payload_len={len(payload)} transport={transport}"
             )
 
         with sess.lock:
             grp = sess.groups.get(seq)
             if grp is None:
-                grp = ShardGroup(total, orig_len)
+                grp = ShardGroup(total, 0)
                 sess.groups[seq] = grp
 
             if grp.delivered:
@@ -837,6 +898,36 @@ class HopShotServer:
                     log.debug(f"[DATA] duplicate shard seq={seq} shard={shard_idx}")
                 return  # duplicate shard — discard
 
+            if frag_count <= 1:
+                shard_payload = payload
+            else:
+                if frag_id < 0 or frag_id >= frag_count:
+                    return
+                frag_state = grp.fragments.get(shard_idx)
+                if frag_state is None or frag_state["count"] != frag_count:
+                    frag_state = {
+                        "count": frag_count,
+                        "parts": [None] * frag_count,
+                        "received": 0,
+                    }
+                    grp.fragments[shard_idx] = frag_state
+                if frag_state["parts"][frag_id] is not None:
+                    return
+                frag_state["parts"][frag_id] = payload
+                frag_state["received"] += 1
+                if frag_state["received"] < frag_count:
+                    return
+                shard_payload = b"".join(frag_state["parts"])
+                grp.fragments.pop(shard_idx, None)
+
+            if len(shard_payload) < 4:
+                if self.verbose:
+                    log.debug(f"[DATA] short shard payload seq={seq} len={len(shard_payload)}")
+                return
+
+            grp.orig_len = struct.unpack_from("!I", shard_payload)[0]
+            shard_data = common.strip_jitter_padding(shard_payload[4:], max_jitter=self.jitter)
+
             grp.shards[shard_idx] = shard_data
             grp.received += 1
 
@@ -847,22 +938,16 @@ class HopShotServer:
                     f"seq={seq} sess={sid} ({grp.received} present)"
                 )
 
-            # Try reconstruct as soon as we have k shards
-            if grp.received >= self.fec_k:
-                try:
-                    recovered = fecmod.reconstruct_data(
-                        grp.shards, self.fec_k, self.fec_m, grp.orig_len
-                    )
-                    grp.delivered = True
-                    stack = "QUIC" if transport == common.TRANSPORT_QUIC else "UDP"
-                    log.info(
-                        f"✓ [{stack}] delivered {len(recovered)} bytes "
-                        f"seq={seq} shards={grp.received}/{total}"
-                    )
-                    self._on_payload(sid, recovered, addr, transport, sess, tx_sock=tx_sock)
-                except Exception as e:
-                    if self.verbose:
-                        log.exception(f"[DATA] FEC reconstruct seq={seq}: {e}")
+            rebuilt = self._reconstruct_group_adaptive(grp)
+            if rebuilt is not None:
+                recovered, used_k, used_m = rebuilt
+                grp.delivered = True
+                stack = "QUIC" if transport == common.TRANSPORT_QUIC else "UDP"
+                log.info(
+                    f"✓ [{stack}] delivered {len(recovered)} bytes "
+                    f"seq={seq} shards={grp.received}/{total} fec={used_k}+{used_m}"
+                )
+                self._on_payload(sid, recovered, addr, transport, sess, tx_sock=tx_sock)
 
     def _on_payload(self, sid, data: bytes, addr, transport, sess: Session, tx_sock: socket.socket | None = None):
         """Application delivery point — reconstruct complete IP packets from FEC shards.

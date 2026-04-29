@@ -8,8 +8,6 @@ __pycache__/
 build/
 dist/
 *.egg-info/
-server.config.json
-client.config.json
 *.log
 *.tmp
 *.temp
