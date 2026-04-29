@@ -22,6 +22,14 @@ HopShot runs a client and a server that exchange UDP traffic through a configura
 - JSON log file support
 - Release version flag on both client and server
 
+### Adaptive features (new)
+
+- On-demand tunnel backend: the server will dynamically create a userspace UDP tunnel relay if a client requests tunnel traffic even when `tunnel_mode` is `off` (`adaptive_tunnel_on_demand`).
+- On-demand proxy backend: proxy relay sessions are accepted on demand even when the server was started in `tunnel` service mode (`adaptive_proxy_on_demand`).
+- Adaptive receive sizing: the server tracks observed client datagram sizes (`max_rx_datagram`) and uses that hint when re-encoding tunnel responses so fragmentation and MTU mismatches are handled gracefully.
+- Adaptive FEC/MTU reassembly: server tolerates varied client FEC parameters and low-MTU fragmentation by reassembling fragments and attempting reconstruction with flexible `k/m` values.
+- ULTRA_NUC mode (client): very high-loss mode with extended hop and high burst multipliers (90%+ loss → x10–x16 bursting).
+
 ### Requirements
 
 - Python 3.10 or newer
