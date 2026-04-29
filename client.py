@@ -33,8 +33,10 @@ import random
 import socket
 import struct
 import sys
+import queue
 import threading
 import time
+from urllib import request as urlrequest
 
 import common
 import fec as fecmod
@@ -228,8 +230,10 @@ def render_config_summary(cfg: dict) -> str:
         title(f"HopShot Client v{__version__}", "cyan", use_color=use_color),
         section_header("Session", "cyan", use_color=use_color),
         key_value("profile", cfg["profile"], value_color="green", use_color=use_color),
+        key_value("service", cfg.get("service_mode", "tunnel"), value_color="cyan", use_color=use_color),
         key_value("adaptive", adaptive_state, value_color="green" if cfg.get("adaptive_mode", True) else "yellow", use_color=use_color),
         key_value("max-ping", f"{max_ping_ms}ms", value_color="cyan", use_color=use_color),
+        key_value("health", f"{cfg.get('health_port', cfg['server_port'] + 2)}", value_color="cyan", use_color=use_color),
         key_value("server", f"{cfg['server_port']} / {cfg['quic_port']}  dests={len(destinations)}", value_color="blue", use_color=use_color),
         key_value("ports", f"{cfg['port_min']}-{cfg['port_max']}  hop={hop_state}", value_color="yellow" if hop_state == "off" else "green", use_color=use_color),
         "",
@@ -241,6 +245,9 @@ def render_config_summary(cfg: dict) -> str:
         key_value("fixed-hop", f"{cfg.get('fixed_hop_ms', 0)}ms", value_color="cyan", use_color=use_color),
         key_value("raw burst", burst_text, value_color="cyan", use_color=use_color),
         key_value("keepalive", f"{cfg.get('keepalive_interval_sec', 0)}s", value_color="cyan", use_color=use_color),
+        key_value("strategy", "udp-raw + quic (parallel)", value_color="green", use_color=use_color),
+        key_value("cc", "Brutal primary, BBR backup", value_color="magenta", use_color=use_color),
+        key_value("proxy-listen", cfg.get("proxy_listen") or "-", value_color="cyan", use_color=use_color),
         key_value("clock offset", f"{cfg.get('clock_offset_ms', 0)}ms", value_color="white", use_color=use_color),
         key_value("tunnel", f"{cfg.get('tunnel_mode', 'off')} / {cfg.get('tunnel_backend', 'off')}", value_color="cyan", use_color=use_color),
         key_value("fec / up", f"{cfg['fec_k']}x{cfg['fec_m']}  declared={cfg['declared_up_kbps']}kbps", value_color="magenta", use_color=use_color),
@@ -295,6 +302,47 @@ def _tcp_tls_path_check(target_ip: str, target_port: int = 443, timeout_sec: flo
             return True
     except Exception:
         return False
+
+
+def _http_health_check(target_ip: str, health_port: int = 10002, timeout_sec: float = 2.0, path: str = "/health") -> bool:
+    url = f"http://{target_ip}:{health_port}{path}"
+    req = urlrequest.Request(url, method="GET", headers={"User-Agent": "HopShot/health"})
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_sec) as resp:
+            status = getattr(resp, "status", 200)
+            return 200 <= int(status) < 400
+    except Exception:
+        return False
+
+
+class ProxyStreamState:
+    def __init__(self, conn: socket.socket, target_host: str, target_port: int):
+        self.conn = conn
+        self.target_host = target_host
+        self.target_port = target_port
+        self.stream_id = 0
+        self.open_event = threading.Event()
+        self.closed = threading.Event()
+        self.inbound = queue.Queue()
+        self.error: str | None = None
+
+
+def _encode_proxy_target(host: str, port: int) -> bytes:
+    host_bytes = host.encode("utf-8", errors="strict")
+    if len(host_bytes) > 255:
+        raise ValueError("proxy host is too long")
+    return struct.pack("!B", len(host_bytes)) + host_bytes + struct.pack("!H", int(port))
+
+
+def _decode_proxy_target(payload: bytes) -> tuple[str, int] | None:
+    if len(payload) < 3:
+        return None
+    host_len = payload[0]
+    if len(payload) < 1 + host_len + 2:
+        return None
+    host = payload[1:1 + host_len].decode("utf-8", errors="replace")
+    port = struct.unpack_from("!H", payload, 1 + host_len)[0]
+    return host, port
 
 
 def run_network_diagnostic(cfg: dict, target_ip: str, sni: str, duration_sec: int = 10) -> dict:
@@ -550,18 +598,22 @@ class HopShotClient:
         self.disable_hop  = cfg.get("disable_hop", False)
         self.adaptive_mode = cfg.get("adaptive_mode", True)
         self.max_ping_ms = int(cfg.get("max_ping_ms", 15000) or 15000)
+        self.health_port = int(cfg.get("health_port", self.server_port + 2) or (self.server_port + 2))
         self.declared_down_kbps = int(cfg.get("declared_down_kbps", 0) or 0)
         self.nuclear_fail_fanout = cfg.get("nuclear_fail_fanout", True)
         self.reactive_probe_enabled = cfg.get("reactive_probe", self.max_ping_ms <= 5000)
         self.startup_capacity_scan = cfg.get("startup_capacity_scan", True)
         self.scan_throttle_threshold_pct = float(cfg.get("scan_throttle_threshold_pct", 80.0))
         self.scan_recovery_threshold_pct = float(cfg.get("scan_recovery_threshold_pct", 20.0))
+        self.service_mode = str(cfg.get("service_mode", "tunnel") or "tunnel").strip().lower()
+        if self.service_mode not in {"tunnel", "proxy"}:
+            self.service_mode = "tunnel"
 
         if self.adaptive_mode:
             self.disable_hop = False
             self.fixed_hop_ms = 0
             self.manual_burst_mult = 0
-        self.tunnel_mode  = cfg.get("tunnel_mode", "off")
+        self.tunnel_mode  = cfg.get("tunnel_mode", "off") if self.service_mode == "tunnel" else "off"
         self.tunnel_iface = cfg.get("tunnel_iface", "hopshot0")
         self.tunnel_mtu   = cfg.get("tunnel_mtu", 1400)
         self.tunnel_addr  = cfg.get("tunnel_address")
@@ -569,6 +621,7 @@ class HopShotClient:
         self.tunnel_route_default = cfg.get("tunnel_route_default", False)
         self.tunnel_udp_bind = cfg.get("tunnel_udp_bind", "127.0.0.1:19090")
         self.tunnel_udp_target = cfg.get("tunnel_udp_target")
+        self.proxy_listen = str(cfg.get("proxy_listen", "127.0.0.1:1080") or "127.0.0.1:1080")
         self._transport_sock = None
         self._tunnel_udp_sock = None
         self._tunnel_udp_target_addr = None
@@ -580,6 +633,11 @@ class HopShotClient:
         self._tunnel = None
         self._tunnel_rx = None
         self._tunnel_assembler = DataReassembler(self.fec_k, self.fec_m, self.jitter)
+        self._proxy_listener = None
+        self._proxy_listener_thread = None
+        self._proxy_sessions: dict[int, ProxyStreamState] = {}
+        self._proxy_sessions_lock = threading.Lock()
+        self._proxy_next_stream_id = 1
 
         # Resolver + multi-destination
         self.resolver     = Resolver(cfg.get("resolvers", DEFAULT_RESOLVERS))
@@ -597,12 +655,14 @@ class HopShotClient:
         self._seq         = 0
         self._seq_lock    = threading.Lock()
 
-        # Brutal CC — single instance shared by both transports
+        # Congestion controller — prefer Brutal, keep BBR as a backup/fallback
         declared_up_kbps = int(cfg.get("declared_up_kbps", 0) or 0)
-        if declared_up_kbps > 0:
-            self.cc = brutal.BrutalSender(declared_up_kbps=declared_up_kbps)
-        else:
-            self.cc = brutal.BBRSender()
+        try:
+            self._cc_primary = brutal.BrutalSender(declared_up_kbps=declared_up_kbps)
+        except Exception:
+            self._cc_primary = brutal.BBRSender()
+        self._cc_backup = brutal.BBRSender()
+        self.cc = self._cc_primary
 
         # Current mode
         self.mode         = common.MODE_NORMAL
@@ -644,7 +704,9 @@ class HopShotClient:
 
         # QUIC
         self.quic         = None
+        self.quic_fallback = None
         self.quic_ok      = False
+        self._quic_fallback_pool = []
 
         self._running     = False
 
@@ -718,6 +780,256 @@ class HopShotClient:
             set_ceil(server_tx_kbps)
             if self.verbose:
                 log.debug(f"[probe] applied server tx cap={server_tx_kbps}kbps")
+
+    def _alloc_proxy_stream_id(self) -> int:
+        with self._proxy_sessions_lock:
+            for _ in range(255):
+                stream_id = self._proxy_next_stream_id
+                self._proxy_next_stream_id = 1 if self._proxy_next_stream_id >= 255 else self._proxy_next_stream_id + 1
+                if stream_id == 0:
+                    continue
+                if stream_id not in self._proxy_sessions:
+                    return stream_id
+        raise RuntimeError("No available proxy stream ids")
+
+    def _register_proxy_stream(self, state: ProxyStreamState) -> int:
+        stream_id = self._alloc_proxy_stream_id()
+        state.stream_id = stream_id
+        with self._proxy_sessions_lock:
+            self._proxy_sessions[stream_id] = state
+        return stream_id
+
+    def _release_proxy_stream(self, stream_id: int):
+        with self._proxy_sessions_lock:
+            state = self._proxy_sessions.pop(stream_id, None)
+        if state:
+            state.closed.set()
+            try:
+                state.conn.close()
+            except Exception:
+                pass
+
+    def _send_proxy_frame(self, pkt_type: int, stream_id: int, payload: bytes = b"") -> None:
+        with self._seq_lock:
+            self._seq = (self._seq + 1) & 0xFFFFFFFF
+            seq = self._seq
+
+        with self._mode_lock:
+            hop_ms = self.hop_ms
+            burst_mult = self.burst_mult
+
+        hdr = common.pack_header(
+            pkt_type=pkt_type,
+            seq=seq,
+            shard_idx=0,
+            total_shards=1,
+            session_id=self.session_id,
+            transport=common.TRANSPORT_RAW,
+            stream_id=stream_id,
+        )
+        pkt = hdr + payload
+        if self.obfs:
+            pkt = common.salamander(pkt, self.seed)
+        if self.masquerade:
+            pkt = HTTP3Masq.wrap(pkt, self.seed, seq)
+        self.cc.pace(len(pkt))
+        self._burst_send(pkt, 0, seq, hop_ms, burst_mult, sock=self._udp_sock if not self.rand_src else None)
+
+    def _start_proxy_listener(self):
+        bind_addr = _parse_udp_endpoint(self.proxy_listen, "127.0.0.1", 1080)
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(bind_addr)
+        listener.listen(64)
+        listener.settimeout(1.0)
+        self._proxy_listener = listener
+        self._proxy_listener_thread = threading.Thread(target=self._proxy_accept_loop, daemon=True)
+        self._proxy_listener_thread.start()
+        log.info(f"[proxy] listening on {bind_addr[0]}:{bind_addr[1]} ({self.service_mode})")
+
+    def _proxy_accept_loop(self):
+        while self._running and self._proxy_listener is not None:
+            try:
+                conn, addr = self._proxy_listener.accept()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self._running and self.verbose:
+                    log.debug(f"[proxy] accept: {e}")
+                continue
+            threading.Thread(target=self._handle_proxy_client, args=(conn, addr), daemon=True).start()
+
+    def _parse_proxy_request(self, conn: socket.socket) -> tuple[str, str, int, bytes]:
+        conn.settimeout(10.0)
+        buffer = b""
+        while True:
+            if buffer.startswith(b"CONNECT "):
+                while b"\r\n\r\n" not in buffer:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("HTTP CONNECT closed before headers complete")
+                    buffer += chunk
+                head, leftover = buffer.split(b"\r\n\r\n", 1)
+                line = head.split(b"\r\n", 1)[0].decode("utf-8", errors="replace")
+                parts = line.split()
+                if len(parts) < 2:
+                    raise RuntimeError("Invalid HTTP CONNECT request")
+                host_port = parts[1]
+                if ":" not in host_port:
+                    raise RuntimeError("HTTP CONNECT requires host:port")
+                host, port_text = host_port.rsplit(":", 1)
+                return "http", host.strip(), int(port_text), leftover
+
+            if buffer.startswith(b"\x05"):
+                while len(buffer) < 2:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("SOCKS5 greeting closed early")
+                    buffer += chunk
+                nmethods = buffer[1]
+                need = 2 + nmethods
+                while len(buffer) < need:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("SOCKS5 greeting incomplete")
+                    buffer += chunk
+                conn.sendall(b"\x05\x00")
+                buffer = buffer[need:]
+                while len(buffer) < 4:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        raise RuntimeError("SOCKS5 request closed early")
+                    buffer += chunk
+                ver, cmd, _rsv, atyp = buffer[:4]
+                if ver != 5 or cmd != 1:
+                    raise RuntimeError("SOCKS5 only supports CONNECT")
+                pos = 4
+                if atyp == 1:
+                    need = pos + 4 + 2
+                    while len(buffer) < need:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            raise RuntimeError("SOCKS5 IPv4 request incomplete")
+                        buffer += chunk
+                    host = socket.inet_ntoa(buffer[pos:pos + 4])
+                    pos += 4
+                elif atyp == 3:
+                    while len(buffer) < pos + 1:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            raise RuntimeError("SOCKS5 domain length missing")
+                        buffer += chunk
+                    host_len = buffer[pos]
+                    pos += 1
+                    while len(buffer) < pos + host_len + 2:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            raise RuntimeError("SOCKS5 domain request incomplete")
+                        buffer += chunk
+                    host = buffer[pos:pos + host_len].decode("utf-8", errors="replace")
+                    pos += host_len
+                elif atyp == 4:
+                    need = pos + 16 + 2
+                    while len(buffer) < need:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            raise RuntimeError("SOCKS5 IPv6 request incomplete")
+                        buffer += chunk
+                    host = socket.inet_ntop(socket.AF_INET6, buffer[pos:pos + 16])
+                    pos += 16
+                else:
+                    raise RuntimeError("SOCKS5 unsupported address type")
+                port = struct.unpack_from("!H", buffer, pos)[0]
+                pos += 2
+                return "socks5", host, port, buffer[pos:]
+
+            chunk = conn.recv(4096)
+            if not chunk:
+                raise RuntimeError("Proxy client disconnected before request")
+            buffer += chunk
+
+    def _proxy_client_writer(self, state: ProxyStreamState):
+        while self._running and not state.closed.is_set():
+            try:
+                pkt = state.inbound.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if pkt is None:
+                break
+            try:
+                state.conn.sendall(pkt)
+            except Exception:
+                break
+        state.closed.set()
+
+    def _handle_proxy_client(self, conn: socket.socket, addr):
+        try:
+            proto, host, port, leftover = self._parse_proxy_request(conn)
+            state = ProxyStreamState(conn, host, port)
+            stream_id = self._register_proxy_stream(state)
+            open_payload = _encode_proxy_target(host, port)
+            self._send_proxy_frame(common.TYPE_PROXY_OPEN, stream_id, open_payload)
+
+            if not state.open_event.wait(timeout=max(10.0, self.max_ping_ms / 1000.0)):
+                raise RuntimeError("proxy open timed out")
+            if state.error:
+                raise RuntimeError(state.error)
+
+            if proto == "socks5":
+                conn.sendall(b"\x05\x00\x00\x01" + b"\x00\x00\x00\x00" + b"\x00\x00")
+            else:
+                conn.sendall(b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: HopShot\r\n\r\n")
+
+            writer = threading.Thread(target=self._proxy_client_writer, args=(state,), daemon=True)
+            writer.start()
+
+            if leftover:
+                self._send_proxy_frame(common.TYPE_PROXY_DATA, stream_id, leftover)
+
+            while self._running and not state.closed.is_set():
+                data = conn.recv(2048)
+                if not data:
+                    break
+                for offset in range(0, len(data), 1000):
+                    chunk = data[offset:offset + 1000]
+                    self._send_proxy_frame(common.TYPE_PROXY_DATA, stream_id, chunk)
+        except Exception as e:
+            if self.verbose:
+                log.debug(f"[proxy] client {addr} closed: {e}")
+        finally:
+            try:
+                if 'stream_id' in locals():
+                    self._send_proxy_frame(common.TYPE_PROXY_CLOSE, stream_id)
+            except Exception:
+                pass
+            if 'stream_id' in locals():
+                self._release_proxy_stream(stream_id)
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _handle_proxy_response(self, hdr: dict, payload: bytes):
+        stream_id = int(hdr.get("stream_id", 0) or 0)
+        if not stream_id:
+            return
+        with self._proxy_sessions_lock:
+            state = self._proxy_sessions.get(stream_id)
+        if state is None:
+            return
+        pkt_type = hdr["type"]
+        if pkt_type == common.TYPE_PROXY_ACK:
+            state.open_event.set()
+        elif pkt_type == common.TYPE_PROXY_ERROR:
+            state.error = payload.decode("utf-8", errors="replace") or "proxy error"
+            state.open_event.set()
+            state.inbound.put(None)
+            self._release_proxy_stream(stream_id)
+        elif pkt_type == common.TYPE_PROXY_DATA:
+            state.inbound.put(payload)
+        elif pkt_type == common.TYPE_PROXY_CLOSE:
+            state.inbound.put(None)
+            self._release_proxy_stream(stream_id)
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -796,82 +1108,122 @@ class HopShotClient:
             self._resume_used = self._try_resume()
             self._record_metric("resume", ok=self._resume_used)
 
-        # Phase 1: probe primary port (unless 0-RTT resume succeeded)
-        if not self._resume_used:
-            result = probe_port(
-                self.primary_ip, self.server_port,
-                count      = self.cfg.get("probe_count", 20),
-                timeout_ms = self.cfg.get("probe_timeout_ms", 2000),
-                seed       = self.seed,
-                obfs       = self.obfs,
-                resume_store=self._resume_store,
-                verbose    = self.verbose,
-                declared_rx_kbps=self.declared_down_kbps,
-                declared_tx_kbps=int(self.cfg.get("declared_up_kbps", 0) or 0),
-            )
-        else:
-            result = {
-                "port": self.server_port,
-                "loss_pct": 0.0,
-                "rtt_ms": 0.0,
-                "sent": 0,
-                "received": 0,
-                "clock_offset_ms": self.clock_offset_ms,
-            }
-        if self.verbose:
-            log.debug(f"[client] probe result: {result}")
-        self._record_metric("probe", **result)
-        self._apply_probe_bandwidth_hints(result)
-        self.clock_offset_ms = int(result.get("clock_offset_ms", self.clock_offset_ms))
-        if self.verbose:
-            log.debug(f"[client] clock offset={self.clock_offset_ms}ms")
+        bootstrap_deadline = time.monotonic() + 180.0
+        bootstrap_attempt = 0
+        server_reached = False
 
-        effective_loss = result["loss_pct"]
-        if self.adaptive_mode:
-            effective_loss, scan = self._startup_auto_scan(result)
-            if scan["udp_throttled"]:
-                log.warning(
-                    f"[scan] startup UDP throttling detected loss={scan['initial_loss_pct']:.1f}% "
-                    f"threshold={self.scan_throttle_threshold_pct:.1f}%"
-                )
-                if scan["udp_port_hopping_bypassed"]:
-                    log.info(
-                        f"[scan] port-hopping bypass succeeded on port={scan['recovery_port']} "
-                        f"loss={scan['recovery_loss_pct']:.1f}%"
-                    )
-                else:
-                    log.warning("[scan] no stable recovery detected on alternate port")
-            self._record_metric("startup_scan", **scan)
-
-        # If multiple destinations, pick the best one
-        if len(self.dest_ips) > 1:
-            self.primary_ip = self.resolver.best_destination(
-                self.dest_ips, self.server_port, self.seed, self.obfs,
-                verbose=self.verbose,
-            )
-            log.info(f"[client] primary IP selected: {self.primary_ip}")
-
-        # Phase 2: classify mode
-        self._set_mode(effective_loss)
-
-        # Phase 3: MTU probe (KCP-style) — determine safe shard size
-        if self._mtu == 0:
+        while self._running and time.monotonic() < bootstrap_deadline and not server_reached:
+            bootstrap_attempt += 1
             if self.verbose:
-                log.debug("[client] startup phase=mtu-probe")
-            self._mtu = self._mtu_prober.probe(
-                self.primary_ip, self.server_port
-            )
-            log.info(f"[MTU] path MTU discovered: {self._mtu + 28} bytes "
-                     f"(safe payload={self._mtu})")
-            self._record_metric("mtu", safe_payload=self._mtu, configured=False)
-        else:
-            log.info(f"[MTU] using user-configured MTU payload={self._mtu}")
-            self._record_metric("mtu", safe_payload=self._mtu, configured=True)
+                log.debug(f"[client] bootstrap attempt={bootstrap_attempt}")
 
-        # Phase 4: connect QUIC alongside raw UDP
-        if self.verbose:
-            log.debug("[client] startup phase=quic-connect")
-        self._connect_quic()
+            if not self._resume_used:
+                health_timeout = max(2.0, min(self.max_ping_ms / 1000.0, 5.0))
+                health_ready_ip = None
+                for candidate_ip in self.dest_ips:
+                    if _http_health_check(candidate_ip, health_port=self.health_port, timeout_sec=health_timeout):
+                        health_ready_ip = candidate_ip
+                        break
+
+                if health_ready_ip:
+                    if health_ready_ip != self.primary_ip:
+                        log.info(f"[health] HTTP /health reachable on {health_ready_ip}:{self.health_port}")
+                    self.primary_ip = health_ready_ip
+                else:
+                    log.warning(
+                        f"[health] no HTTP /health response on port {self.health_port}; "
+                        "continuing with probe and transport fallback"
+                    )
+
+                # Increase probe timeout for unstable networks
+                probe_timeout = max(
+                    self.cfg.get("probe_timeout_ms", 2000),
+                    int(self.max_ping_ms * 1.5)
+                )
+                probe_count = max(20, self.cfg.get("probe_count", 20))
+
+                result = probe_port(
+                    self.primary_ip, self.server_port,
+                    count=probe_count,
+                    timeout_ms=probe_timeout,
+                    seed=self.seed,
+                    obfs=self.obfs,
+                    resume_store=self._resume_store,
+                    verbose=self.verbose,
+                    declared_rx_kbps=self.declared_down_kbps,
+                    declared_tx_kbps=int(self.cfg.get("declared_up_kbps", 0) or 0),
+                )
+            else:
+                result = {
+                    "port": self.server_port,
+                    "loss_pct": 0.0,
+                    "rtt_ms": 0.0,
+                    "sent": 0,
+                    "received": 0,
+                    "clock_offset_ms": self.clock_offset_ms,
+                }
+
+            if self.verbose:
+                log.debug(f"[client] probe result: {result}")
+            self._record_metric("probe", **result)
+            self._apply_probe_bandwidth_hints(result)
+            self.clock_offset_ms = int(result.get("clock_offset_ms", self.clock_offset_ms))
+            if self.verbose:
+                log.debug(f"[client] clock offset={self.clock_offset_ms}ms")
+
+            effective_loss = result["loss_pct"]
+            if self.adaptive_mode:
+                effective_loss, scan = self._startup_auto_scan(result)
+                if scan["udp_throttled"]:
+                    log.warning(
+                        f"[scan] startup UDP throttling detected loss={scan['initial_loss_pct']:.1f}% "
+                        f"threshold={self.scan_throttle_threshold_pct:.1f}%"
+                    )
+                    if scan["udp_port_hopping_bypassed"]:
+                        log.info(
+                            f"[scan] port-hopping bypass succeeded on port={scan['recovery_port']} "
+                            f"loss={scan['recovery_loss_pct']:.1f}%"
+                        )
+                    else:
+                        log.warning("[scan] no stable recovery detected on alternate port")
+                self._record_metric("startup_scan", **scan)
+
+            if len(self.dest_ips) > 1:
+                self.primary_ip = self.resolver.best_destination(
+                    self.dest_ips, self.server_port, self.seed, self.obfs,
+                    verbose=self.verbose,
+                )
+                log.info(f"[client] primary IP selected: {self.primary_ip}")
+
+            self._set_mode(effective_loss)
+
+            if self._mtu == 0 and (self._resume_used or result.get("received", 0) > 0 or self.quic_ok):
+                if self.verbose:
+                    log.debug("[client] startup phase=mtu-probe")
+                self._mtu = self._mtu_prober.probe(self.primary_ip, self.server_port)
+                log.info(f"[MTU] path MTU discovered: {self._mtu + 28} bytes "
+                         f"(safe payload={self._mtu})")
+                self._record_metric("mtu", safe_payload=self._mtu, configured=False)
+            else:
+                log.info(f"[MTU] using user-configured MTU payload={self._mtu}")
+                self._record_metric("mtu", safe_payload=self._mtu, configured=True)
+
+            if self.service_mode != "proxy":
+                if self.verbose:
+                    log.debug("[client] startup phase=quic-connect")
+                self._connect_quic()
+
+            server_reached = bool(self._resume_used or self.quic_ok or result.get("received", 0) > 0)
+            if not server_reached and self._running and time.monotonic() < bootstrap_deadline:
+                backoff_sec = min(5.0, max(0.5, 0.5 * bootstrap_attempt))
+                log.warning(
+                    f"[bootstrap] server not reachable yet; retrying attempt {bootstrap_attempt} "
+                    f"for up to 180s total (sleep {backoff_sec:.1f}s)"
+                )
+                time.sleep(backoff_sec)
+
+        if not server_reached:
+            log.warning("[bootstrap] 3-minute reachability budget expired; starting background loops anyway")
 
         # Background loops
         # Non-tunnel mode receives BW feedback on the stable raw UDP socket.
@@ -880,15 +1232,17 @@ class HopShotClient:
         threading.Thread(target=self._monitor_loop,      daemon=True).start()
         if self.keepalive_interval_sec > 0:
             threading.Thread(target=self._heartbeat_loop, daemon=True).start()
-        if self.tunnel_mode != "off" and self._transport_sock is not None:
-            threading.Thread(target=self._tunnel_rx_loop, daemon=True).start()
+            if self.verbose:
+                log.debug("[client] startup phase=quic-connect")
+            self._connect_quic()
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
 
         log.info(
             f"[client] ready | mode={common.MODE_NAMES[self.mode]} "
             f"| hop={self.hop_ms}ms | burst=x{self.burst_mult} "
             f"| jitter={self.jitter}B | rand_src={self.rand_src} "
-            f"| preemptive={self.preemptive}ms | keepalive={self.keepalive_interval_sec}s"
+            f"| preemptive={self.preemptive}ms | keepalive={self.keepalive_interval_sec}s "
+            f"| transport=udp-raw+quic"
         )
         self._record_metric("ready", hop_ms=self.hop_ms, burst_mult=self.burst_mult)
 
@@ -968,28 +1322,156 @@ class HopShotClient:
             )
 
     def _connect_quic(self):
+        """Connect QUIC with resilient retry and fallback logic."""
         try:
             if self.verbose:
                 log.debug(f"[QUIC] connecting to {self.primary_ip}:{self.quic_port}")
-            self.quic    = QUICClient(
+            
+            # Extended timeout for unstable networks
+            base_timeout = max(8.0, self.max_ping_ms / 1000.0)
+            
+            self.quic = QUICClient(
                 self.primary_ip,
                 self.quic_port,
                 verify=False,
-                connect_timeout=max(5.0, self.max_ping_ms / 1000.0),
+                connect_timeout=base_timeout,
+                max_retries=5,  # Retry up to 5 times
+                initial_backoff_ms=500,  # Start with 500ms backoff
             )
-            self.quic_ok = self.quic.connect()
+            
+            # Attempt connection with retries
+            self.quic_ok = self.quic.connect(retry=True)
+            
             if self.quic_ok:
-                log.info("[QUIC] connected (TLS 1.3)")
-                self._record_metric("quic_connect", ok=True)
+                log.info("[QUIC] connected successfully (TLS 1.3)")
+                self._record_metric("quic_connect", ok=True, timeout_sec=base_timeout)
             else:
-                log.warning("[QUIC] failed -> raw UDP only")
-                self._record_metric("quic_connect", ok=False)
+                log.warning("[QUIC] connection failed after retries -> falling back to raw UDP")
+                self._record_metric("quic_connect", ok=False, timeout_sec=base_timeout)
+                if len(self.dest_ips) > 1 and self._connect_quic_multi_fallback(base_timeout):
+                    self._record_metric("quic_connect", ok=True, fallback=True, multi_connection=True)
+                else:
+                    self._record_metric("quic_connect", ok=False, fallback_attempted=True)
         except Exception as e:
-            log.warning(f"[QUIC] unavailable: {e}")
+            log.warning(f"[QUIC] exception: {e}")
             self.quic_ok = False
             if self.verbose:
-                log.exception("[QUIC] connect exception")
+                log.exception("[QUIC] connection exception")
             self._record_metric("quic_connect", ok=False, error=str(e))
+
+    def _connect_quic_multi_fallback(self, base_timeout: float) -> bool:
+        """Race QUIC connections across all resolved destinations after the primary path fails."""
+        candidates = []
+        for ip in self.dest_ips:
+            candidate = (ip, self.quic_port)
+            if candidate not in candidates:
+                candidates.append(candidate)
+
+        if len(candidates) <= 1:
+            return False
+
+        log.warning(f"[QUIC] primary path failed; racing {len(candidates)} QUIC connection candidates")
+        winner = {"client": None, "host": None, "port": None}
+        winner_lock = threading.Lock()
+        done = threading.Event()
+        pool: list[QUICClient] = []
+        self._quic_fallback_pool = pool
+
+        def attempt(host: str, port: int):
+            if done.is_set():
+                return
+            client = QUICClient(
+                host,
+                port,
+                verify=False,
+                connect_timeout=base_timeout,
+                max_retries=2,
+                initial_backoff_ms=750,
+            )
+            pool.append(client)
+            if done.is_set():
+                client.close()
+                return
+            if client.connect(retry=True):
+                with winner_lock:
+                    if not done.is_set():
+                        winner["client"] = client
+                        winner["host"] = host
+                        winner["port"] = port
+                        done.set()
+                    else:
+                        client.close()
+            else:
+                client.close()
+
+        threads = [threading.Thread(target=attempt, args=(host, port), daemon=True) for host, port in candidates]
+        for thread in threads:
+            thread.start()
+
+        deadline = time.monotonic() + max(10.0, base_timeout * 2)
+        while time.monotonic() < deadline and not done.is_set():
+            time.sleep(0.1)
+
+        if not done.is_set() or winner["client"] is None:
+            for client in pool:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+            return False
+
+        self.quic = winner["client"]
+        self.primary_ip = winner["host"] or self.primary_ip
+        self.quic_port = winner["port"] or self.quic_port
+        self.quic_ok = True
+        log.info(f"[QUIC] multi-connection fallback succeeded on {self.primary_ip}:{self.quic_port}")
+        for client in pool:
+            if client is not self.quic:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        return True
+
+    def _check_and_recover_quic(self):
+        """Check QUIC connection health and attempt recovery if disconnected."""
+        if not self.quic or not self.quic_ok:
+            if self.verbose:
+                log.debug("[QUIC] connection status check: not connected, attempting recovery")
+            self._connect_quic()
+            return
+        
+        # Check if connection is still healthy
+        if not self.quic.connected:
+            log.warning("[QUIC] connection lost, attempting recovery")
+            self.quic_ok = False
+            self._record_metric("quic_recovery", reason="disconnected")
+            
+            # Try to reconnect with slightly longer timeout
+            try:
+                base_timeout = max(8.0, self.max_ping_ms / 1000.0)
+                self.quic = QUICClient(
+                    self.primary_ip,
+                    self.quic_port,
+                    verify=False,
+                    connect_timeout=base_timeout,
+                    max_retries=3,
+                    initial_backoff_ms=1000,
+                )
+                self.quic_ok = self.quic.connect(retry=True)
+                
+                if self.quic_ok:
+                    log.info("[QUIC] recovery successful")
+                    self._record_metric("quic_recovery", ok=True)
+                else:
+                    log.warning("[QUIC] recovery failed")
+                    if self._connect_quic_multi_fallback(base_timeout):
+                        self._record_metric("quic_recovery", ok=True, multi_connection=True)
+                    else:
+                        self._record_metric("quic_recovery", ok=False)
+            except Exception as e:
+                log.warning(f"[QUIC] recovery error: {e}")
+                self._record_metric("quic_recovery", ok=False, error=str(e))
 
     # ── Core send ─────────────────────────────────────────────────────────────
 
@@ -1099,7 +1581,7 @@ class HopShotClient:
                     log.debug(f"[send] shard={shard_idx} wrapped for HTTP/3 masquerade")
 
             # ── Brutal CC pacing ──────────────────────────────────────────────
-            self.cc.pace(len(pkt))
+            self._cc_pace(len(pkt))
 
             # ── Burst across ports AND destinations ───────────────────────────
             self._burst_send(
@@ -1127,13 +1609,13 @@ class HopShotClient:
                     quic_pkt = common.salamander(quic_pkt, self.seed)
                 try:
                     self.quic.send(quic_pkt)
-                    self.cc.record_sent(len(quic_pkt))
+                    self._cc_record_sent(len(quic_pkt))
                     if self.verbose:
                         log.debug(f"[QUIC] shard={shard_idx} sent {len(quic_pkt)}B")
                 except Exception as e:
                     log.debug(f"[QUIC] shard {shard_idx}: {e}")
 
-        rate, rtt = self.cc.stats()
+        rate, rtt = self._cc_stats()
         log.info(f"[BrutalCC] rate={rate:.0f}kbps  rtt={rtt:.0f}ms")
         self._record_metric("send_done", seq=seq, rate=rate, rtt=rtt)
 
@@ -1201,7 +1683,7 @@ class HopShotClient:
                     s.close()
                 else:
                     sock.sendto(pkt, (dest_ip, dst_port))
-                self.cc.record_sent(len(pkt))
+                self._cc_record_sent(len(pkt))
                 if self.verbose:
                     log.debug(
                         f"  shard={shard_idx} burst={burst} "
@@ -1211,6 +1693,48 @@ class HopShotClient:
             except Exception as e:
                 if self.verbose:
                     log.exception(f"[burst] send {dest_ip}:{dst_port} failed: {e}")
+
+    # Congestion controller wrappers — fallback to BBR on errors
+    def _cc_pace(self, n: int):
+        try:
+            self.cc.pace(n)
+        except Exception:
+            if getattr(self, '_cc_backup', None) is not None and self.cc is not self._cc_backup:
+                try:
+                    log.warning("[CC] primary CC failed; switching to backup BBR")
+                except Exception:
+                    pass
+                self.cc = self._cc_backup
+
+    def _cc_record_sent(self, n: int):
+        try:
+            self.cc.record_sent(n)
+        except Exception:
+            if getattr(self, '_cc_backup', None) is not None and self.cc is not self._cc_backup:
+                self.cc = self._cc_backup
+
+    def _cc_stats(self):
+        try:
+            return self.cc.stats()
+        except Exception:
+            if getattr(self, '_cc_backup', None) is not None and self.cc is not self._cc_backup:
+                self.cc = self._cc_backup
+                try:
+                    return self.cc.stats()
+                except Exception:
+                    return 0.0, 0.0
+            return 0.0, 0.0
+
+    def _cc_on_feedback(self, recv_kbps: int, rtt_ms: int, loss_pct: float):
+        try:
+            self.cc.on_feedback(recv_kbps, rtt_ms, loss_pct)
+        except Exception:
+            if getattr(self, '_cc_backup', None) is not None and self.cc is not self._cc_backup:
+                self.cc = self._cc_backup
+                try:
+                    self.cc.on_feedback(recv_kbps, rtt_ms, loss_pct)
+                except Exception:
+                    pass
 
     def _hop_port(self, offset: int, hop_ms: int) -> int:
         """
@@ -1296,7 +1820,7 @@ class HopShotClient:
                     fb = common.unpack_bw_feedback(payload)
                     if fb:
                         recv_kbps, rtt_ms, loss_pct = fb
-                        self.cc.on_feedback(recv_kbps, rtt_ms, loss_pct)
+                        self._cc_on_feedback(recv_kbps, rtt_ms, loss_pct)
                 elif hdr["type"] == common.TYPE_MTU_REPLY:
                     if len(payload) >= 2:
                         self._mtu = struct.unpack_from("!H", payload)[0]
@@ -1384,7 +1908,7 @@ class HopShotClient:
                     fb = common.unpack_bw_feedback(payload)
                     if fb:
                         recv_kbps, rtt_ms, loss_pct = fb
-                        self.cc.on_feedback(recv_kbps, rtt_ms, loss_pct)
+                        self._cc_on_feedback(recv_kbps, rtt_ms, loss_pct)
                         log.info(
                             f"[BrutalCC] <- recv={recv_kbps}kbps "
                             f"rtt={rtt_ms}ms loss={loss_pct}% "
@@ -1398,6 +1922,13 @@ class HopShotClient:
                             rtt_ms=rtt_ms,
                             loss_pct=loss_pct,
                         )
+                elif hdr and hdr["type"] in {
+                    common.TYPE_PROXY_ACK,
+                    common.TYPE_PROXY_DATA,
+                    common.TYPE_PROXY_CLOSE,
+                    common.TYPE_PROXY_ERROR,
+                }:
+                    self._handle_proxy_response(hdr, payload)
             except socket.timeout:
                 pass
             except Exception as e:
@@ -1407,8 +1938,11 @@ class HopShotClient:
     # ── Monitor: re-probe every 30s and re-select best dest ──────────────────
 
     def _monitor_loop(self):
+        """Continuously monitor connection health and adapt to network conditions."""
+        last_quic_check = time.time()
         while self._running:
             time.sleep(30)
+            
             # Re-probe primary
             result = probe_port(
                 self.primary_ip, self.server_port,
@@ -1446,6 +1980,12 @@ class HopShotClient:
                     self._record_metric("primary_ip", ip=best)
                 elif self.verbose:
                     log.debug(f"[monitor] primary unchanged: {self.primary_ip}")
+            
+            # Check QUIC connection health and reconnect if necessary
+            now = time.time()
+            if now - last_quic_check >= 60:  # Check every 60 seconds
+                self._check_and_recover_quic()
+                last_quic_check = now
 
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
@@ -1453,6 +1993,12 @@ class HopShotClient:
         self._running = False
         if self.quic:
             self.quic.close()
+        for client in getattr(self, "_quic_fallback_pool", []):
+            try:
+                if client is not self.quic:
+                    client.close()
+            except Exception:
+                pass
         if self._udp_sock:
             try:
                 self._udp_sock.close()
@@ -1468,6 +2014,13 @@ class HopShotClient:
                 self._tunnel_udp_sock.close()
             except Exception:
                 pass
+        if self._proxy_listener:
+            try:
+                self._proxy_listener.close()
+            except Exception:
+                pass
+        for stream_id in list(getattr(self, "_proxy_sessions", {}).keys()):
+            self._release_proxy_stream(stream_id)
         if self._tunnel:
             try:
                 self._tunnel.close()
@@ -1531,6 +2084,8 @@ Examples:
                    help="Server base UDP port")
     p.add_argument("--quic-port",       type=int, default=None,
                    help="Server QUIC/TLS port (default: --port + 1)")
+    p.add_argument("--health-port",     type=int, default=None,
+                   help="HTTPS /health port (default: --port + 2)")
     p.add_argument("--port-min",        type=int, default=10000,
                    help="Hop port range minimum")
     p.add_argument("--port-max",        type=int, default=65000,
@@ -1540,6 +2095,8 @@ Examples:
     p.add_argument("--profile",        choices=sorted(PROFILE_PRESETS.keys()),
                    default="balanced",
                    help="Preset profile: balanced, reliable, stealth, or throughput")
+    p.add_argument("--service-mode", choices=("tunnel", "proxy"), default="tunnel",
+                   help="Choose tunnel mode or local SOCKS5/HTTP proxy mode")
     p.add_argument("--obfs",            action="store_true",
                    help="Enable Salamander obfuscation")
     p.add_argument("--rand-src-port",   action="store_true",
@@ -1590,6 +2147,8 @@ Examples:
                    help="Userspace UDP relay bind endpoint host:port")
     p.add_argument("--tunnel-udp-target", default=None,
                    help="Userspace UDP relay egress target host:port")
+    p.add_argument("--proxy-listen",    default="127.0.0.1:1080",
+                   help="Local SOCKS5/HTTP CONNECT proxy listen endpoint host:port")
     p.add_argument("--declared-up",     type=int, default=0,
                    help="User-declared uplink bandwidth in kbps (0=auto). "
                         "Sets Brutal CC ceiling — prevents ISP QoS triggers. "
@@ -1633,10 +2192,12 @@ Examples:
     cfg = {
         "server_port":       args.port,
         "quic_port":         args.quic_port or args.port + 1,
+        "health_port":       args.health_port or args.port + 2,
         "port_min":          args.port_min,
         "port_max":          args.port_max,
         "shared_seed":       args.seed,
         "profile":           args.profile,
+        "service_mode":      args.service_mode,
         "obfs":              args.obfs,
         "rand_src_port":     args.rand_src_port,
         "jitter_bytes":      args.jitter,
@@ -1659,6 +2220,7 @@ Examples:
         "tunnel_local_port": args.tunnel_local_port,
         "tunnel_udp_bind": args.tunnel_udp_bind,
         "tunnel_udp_target": args.tunnel_udp_target,
+        "proxy_listen":     args.proxy_listen,
         "declared_up_kbps":  args.declared_up,
         "declared_down_kbps": args.declared_down,
         "masquerade":        args.masquerade,

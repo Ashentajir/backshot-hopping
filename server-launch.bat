@@ -15,15 +15,26 @@ echo 2. Easy setup only (no start)
 echo 3. Diagnose server config
 echo 4. Generate shared seed for server/client configs
 echo 5. Start server (normal)
+echo 6. Edit server config (service_mode/proxy/health)
 echo X. Exit
 echo.
-choice /c 12345X /n /m "Select an option: "
-if errorlevel 6 goto :end
+choice /c 123456X /n /m "Select an option: "
+if errorlevel 7 goto :end
+if errorlevel 6 goto :edit_config
 if errorlevel 5 goto :start_normal
 if errorlevel 4 goto :genkey
 if errorlevel 3 goto :diagnose
 if errorlevel 2 goto :easy_prepare
 if errorlevel 1 goto :easy_start
+goto :main
+
+:edit_config
+if exist server.config.json (
+  start "" notepad server.config.json
+) else (
+  echo server.config.json not found yet. Run easy setup first.
+  pause
+)
 goto :main
 
 :easy_start

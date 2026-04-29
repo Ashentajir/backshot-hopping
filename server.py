@@ -24,6 +24,8 @@ import logging
 import os
 import socket
 import struct
+import ssl
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import subprocess
 import sys
 import threading
@@ -64,6 +66,36 @@ def _parse_udp_endpoint(value: str | None, default_host: str, default_port: int)
     if port < 1 or port > 65535:
         raise ValueError(f"Invalid endpoint '{text}', port out of range")
     return host, port
+
+
+def _decode_proxy_target(payload: bytes) -> tuple[str, int] | None:
+    if len(payload) < 3:
+        return None
+    host_len = payload[0]
+    if len(payload) < 1 + host_len + 2:
+        return None
+    host = payload[1:1 + host_len].decode("utf-8", errors="replace")
+    port = struct.unpack_from("!H", payload, 1 + host_len)[0]
+    return host, port
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    server_version = "HopShotHealth/1.0"
+
+    def do_GET(self):
+        if self.path not in {"/", "/health", "/ping"}:
+            self.send_error(404)
+            return
+
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        log.debug("[health] " + fmt, *args)
 
 
 # ─── Shard group ──────────────────────────────────────────────────────────────
@@ -116,7 +148,12 @@ class HopShotServer:
         self.declared_down_kbps = cfg.get("declared_down_kbps", 0)
         self.max_ping_ms = int(cfg.get("max_ping_ms", 15000) or 15000)
         self.session_timeout_sec = max(60, int((self.max_ping_ms * 3) / 1000))
+        self.service_mode = str(cfg.get("service_mode", "tunnel") or "tunnel").strip().lower()
+        if self.service_mode not in {"tunnel", "proxy"}:
+            self.service_mode = "tunnel"
         self.tunnel_mode = cfg.get("tunnel_mode", "off")
+        if self.service_mode == "proxy":
+            self.tunnel_mode = "off"
         self.tunnel_iface = cfg.get("tunnel_iface", "hopshot0")
         self.tunnel_mtu   = cfg.get("tunnel_mtu", 1400)
         self.tunnel_addr  = cfg.get("tunnel_address")
@@ -146,8 +183,12 @@ class HopShotServer:
 
         # QUIC server
         self.quic_srv = None
+        self.health_srv = None
+        self.health_thread = None
         self._tunnel = None
         self._tunnel_udp_sock = None
+        self._proxy_relays = {}
+        self._proxy_relays_lock = threading.Lock()
 
         if self.tunnel_mode in {"tun", "tap"}:
             try:
@@ -183,6 +224,109 @@ class HopShotServer:
                 f"tunnel_udp_bind={self.tunnel_udp_bind} tunnel_udp_target={self.tunnel_udp_target} "
                 f"max_ping_ms={self.max_ping_ms} session_timeout={self.session_timeout_sec}s"
             )
+
+    def _reply_sockets(self, tx_sock: socket.socket | None = None) -> list[socket.socket]:
+        sockets: list[socket.socket] = []
+        if tx_sock is not None:
+            sockets.append(tx_sock)
+        if self.udp_sock is not None and self.udp_sock not in sockets:
+            sockets.append(self.udp_sock)
+        for sock in self.extra_udp_socks:
+            if sock not in sockets:
+                sockets.append(sock)
+        fanout = max(1, int(self.cfg.get("reply_fanout", 4) or 4))
+        return sockets[:fanout]
+
+    def _send_reply_fanout(self, pkt: bytes, addr, tx_sock: socket.socket | None = None, label: str = "reply"):
+        for sock in self._reply_sockets(tx_sock):
+            try:
+                sock.sendto(pkt, addr)
+            except Exception as e:
+                if self.verbose:
+                    log.debug(f"[{label}] fanout send failed via {sock.getsockname() if hasattr(sock, 'getsockname') else 'sock'}: {e}")
+
+    def _proxy_key(self, session_id: int, stream_id: int) -> tuple[int, int]:
+        return session_id, stream_id
+
+    def _proxy_send_frame(self, session_id: int, stream_id: int, pkt_type: int, payload: bytes, addr, tx_sock: socket.socket | None = None):
+        pkt = common.pack_header(
+            pkt_type=pkt_type,
+            seq=0,
+            session_id=session_id,
+            transport=common.TRANSPORT_RAW,
+            stream_id=stream_id,
+        ) + payload
+        if self.obfs:
+            pkt = common.salamander(pkt, self.seed)
+        self._send_reply_fanout(pkt, addr, tx_sock=tx_sock, label="proxy")
+
+    def _proxy_close(self, session_id: int, stream_id: int):
+        key = self._proxy_key(session_id, stream_id)
+        with self._proxy_relays_lock:
+            relay = self._proxy_relays.pop(key, None)
+        if relay is not None:
+            try:
+                relay.close()
+            except Exception:
+                pass
+
+    def _proxy_reader_loop(self, session_id: int, stream_id: int, relay_sock: socket.socket, addr, tx_sock: socket.socket | None = None):
+        relay_sock.settimeout(1.0)
+        key = self._proxy_key(session_id, stream_id)
+        while self._running:
+            with self._proxy_relays_lock:
+                if key not in self._proxy_relays:
+                    break
+            try:
+                data = relay_sock.recv(4096)
+                if not data:
+                    break
+                self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_DATA, data, addr, tx_sock=tx_sock)
+            except socket.timeout:
+                continue
+            except Exception:
+                break
+        self._proxy_close(session_id, stream_id)
+        self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_CLOSE, b"", addr, tx_sock=tx_sock)
+
+    def _handle_proxy_open(self, hdr: dict, payload: bytes, addr, tx_sock: socket.socket | None = None):
+        target = _decode_proxy_target(payload)
+        stream_id = int(hdr.get("stream_id", 0) or 0)
+        session_id = int(hdr.get("session_id", 0) or 0)
+        if not stream_id or not target:
+            self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_ERROR, b"bad target", addr, tx_sock=tx_sock)
+            return
+        host, port = target
+        try:
+            relay_sock = socket.create_connection((host, port), timeout=max(3.0, self.max_ping_ms / 1000.0))
+            relay_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except Exception as e:
+            self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_ERROR, str(e).encode("utf-8", errors="replace"), addr, tx_sock=tx_sock)
+            return
+
+        key = self._proxy_key(session_id, stream_id)
+        with self._proxy_relays_lock:
+            self._proxy_relays[key] = relay_sock
+        self._proxy_send_frame(session_id, stream_id, common.TYPE_PROXY_ACK, b"", addr, tx_sock=tx_sock)
+        threading.Thread(target=self._proxy_reader_loop, args=(session_id, stream_id, relay_sock, addr, tx_sock), daemon=True).start()
+
+    def _handle_proxy_data(self, hdr: dict, payload: bytes):
+        stream_id = int(hdr.get("stream_id", 0) or 0)
+        session_id = int(hdr.get("session_id", 0) or 0)
+        key = self._proxy_key(session_id, stream_id)
+        with self._proxy_relays_lock:
+            relay_sock = self._proxy_relays.get(key)
+        if relay_sock is None:
+            return
+        try:
+            relay_sock.sendall(payload)
+        except Exception:
+            self._proxy_close(session_id, stream_id)
+
+    def _handle_proxy_close(self, hdr: dict):
+        stream_id = int(hdr.get("stream_id", 0) or 0)
+        session_id = int(hdr.get("session_id", 0) or 0)
+        self._proxy_close(session_id, stream_id)
 
     # ── Startup ───────────────────────────────────────────────────────────────
 
@@ -222,6 +366,14 @@ class HopShotServer:
         except Exception as e:
             log.warning(f"QUIC init failed (continuing raw-UDP only): {e}")
 
+        # HTTPS health endpoint for reachability checks when ping is unavailable.
+        try:
+            health_port = int(self.cfg.get("health_port", self.listen_port + 2))
+            self._start_health_server(health_port)
+            log.info(f"HTTPS health endpoint listening on :{health_port}")
+        except Exception as e:
+            log.warning(f"HTTPS health endpoint unavailable: {e}")
+
         # Threads
         threading.Thread(target=self._udp_loop,     daemon=True).start()
         for idx, extra_sock in enumerate(self.extra_udp_socks):
@@ -236,6 +388,14 @@ class HopShotServer:
             threading.Thread(target=self._tunnel_tx_loop, daemon=True).start()
 
         log.info("Server ready.")
+
+    def _start_health_server(self, port: int):
+        srv = ThreadingHTTPServer(("0.0.0.0", port), _HealthHandler)
+        srv.daemon_threads = True
+        srv.allow_reuse_address = True
+        self.health_srv = srv
+        self.health_thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        self.health_thread.start()
 
     # ── UDP receive loop ──────────────────────────────────────────────────────
 
@@ -345,6 +505,12 @@ class HopShotServer:
             self._handle_mtu_probe(hdr, payload, addr, len(pkt), tx_sock=recv_sock)
         elif t == common.TYPE_KEEPALIVE:
             self._handle_keepalive(hdr, addr)
+        elif t == common.TYPE_PROXY_OPEN:
+            self._handle_proxy_open(hdr, payload, addr, tx_sock=recv_sock)
+        elif t == common.TYPE_PROXY_DATA:
+            self._handle_proxy_data(hdr, payload)
+        elif t == common.TYPE_PROXY_CLOSE:
+            self._handle_proxy_close(hdr)
 
     # ── QUIC receive ──────────────────────────────────────────────────────────
 
@@ -404,7 +570,7 @@ class HopShotServer:
         if self.obfs:
             reply = common.salamander(reply, self.seed)
         try:
-            tx_sock.sendto(reply, addr)
+            self._send_reply_fanout(reply, addr, tx_sock=tx_sock, label="probe")
         except Exception:
             pass
         if self.verbose:
@@ -446,7 +612,7 @@ class HopShotServer:
         if self.obfs:
             ack = common.salamander(ack, self.seed)
         try:
-            tx_sock.sendto(ack, addr)
+            self._send_reply_fanout(ack, addr, tx_sock=tx_sock, label="resume")
             log.info(f"[resume] accepted sid={sid} addr={addr}")
         except Exception:
             pass
@@ -527,7 +693,7 @@ class HopShotServer:
         if self.obfs:
             reply = common.salamander(reply, self.seed)
         try:
-            tx_sock.sendto(reply, addr)
+            self._send_reply_fanout(reply, addr, tx_sock=tx_sock, label="mtu")
         except Exception:
             pass
         if self.verbose:
@@ -656,7 +822,7 @@ class HopShotServer:
             if self.obfs:
                 pkt = common.salamander(pkt, self.seed)
             try:
-                tx_sock.sendto(pkt, feedback_addr)
+                self._send_reply_fanout(pkt, feedback_addr, tx_sock=tx_sock, label="feedback")
             except Exception:
                 pass
             log.info(
@@ -787,12 +953,26 @@ class HopShotServer:
             self.udp_sock.close()
         except Exception:
             pass
+        with self._proxy_relays_lock:
+            relays = list(self._proxy_relays.values())
+            self._proxy_relays.clear()
+        for relay in relays:
+            try:
+                relay.close()
+            except Exception:
+                pass
         for s in self.extra_udp_socks:
             try:
                 s.close()
             except Exception:
                 pass
         self.extra_udp_socks = []
+        if self.health_srv:
+            try:
+                self.health_srv.shutdown()
+                self.health_srv.server_close()
+            except Exception:
+                pass
         if self.quic_srv:
             self.quic_srv.stop()
         if self._tunnel:
@@ -820,6 +1000,9 @@ def main():
     parser.add_argument("--version", action="version", version=f"HopShot Server {__version__}")
     parser.add_argument("--port",         type=int, default=10000, help="Raw UDP listen port")
     parser.add_argument("--quic-port",    type=int, default=10001, help="QUIC/TLS listen port")
+    parser.add_argument("--health-port",  type=int, default=10002, help="HTTPS health listen port")
+    parser.add_argument("--service-mode", choices=("tunnel", "proxy"), default="tunnel",
+                        help="Choose tunnel mode or proxy relay mode")
     parser.add_argument("--port-min",     type=int, default=10000, help="Hop range min")
     parser.add_argument("--port-max",     type=int, default=65000, help="Hop range max")
     parser.add_argument("--seed",         default="hopshot-default-seed", help="Shared secret seed")
@@ -862,6 +1045,8 @@ def main():
     cfg = {
         "listen_port":    args.port,
         "quic_port":      args.quic_port,
+        "health_port":    args.health_port,
+        "service_mode":   args.service_mode,
         "port_min":       args.port_min,
         "port_max":       args.port_max,
         "shared_seed":    args.seed,
@@ -909,7 +1094,9 @@ def main():
         title(f"HopShot Server v{__version__}", "cyan", use_color=use_color),
         section_header("Listener", "cyan", use_color=use_color),
         key_value("listen", f"{cfg['listen_port']}", value_color="green", use_color=use_color),
+        key_value("service", f"{cfg.get('service_mode', 'tunnel')}", value_color="cyan", use_color=use_color),
         key_value("quic", f"{cfg['quic_port']}", value_color="blue", use_color=use_color),
+        key_value("health", f"{cfg.get('health_port', 10002)}", value_color="cyan", use_color=use_color),
         key_value("port-range", f"{cfg['port_min']}-{cfg['port_max']}", value_color="cyan", use_color=use_color),
         "",
         section_header("Transport", "blue", use_color=use_color),

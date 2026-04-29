@@ -20,6 +20,8 @@ VENV_DIR = ROOT / ".venv"
 SERVER_DEFAULT_CONFIG = {
     "listen_port": 10000,
     "quic_port": 10001,
+    "health_port": 10002,
+    "service_mode": "tunnel",
     "port_min": 10000,
     "port_max": 65000,
     "shared_seed": "change-me",
@@ -51,6 +53,8 @@ SERVER_DEFAULT_CONFIG = {
 CLIENT_DEFAULT_CONFIG = {
     "server_port": 10000,
     "quic_port": 10001,
+    "health_port": 10002,
+    "service_mode": "tunnel",
     "port_min": 10000,
     "port_max": 65000,
     "shared_seed": "change-me",
@@ -72,6 +76,7 @@ CLIENT_DEFAULT_CONFIG = {
     "tunnel_route_default": True,
     "tunnel_udp_bind": "127.0.0.1:19090",
     "tunnel_udp_target": None,
+    "proxy_listen": "127.0.0.1:1080",
     "declared_up_kbps": 0,
     "declared_down_kbps": 0,
     "masquerade": False,

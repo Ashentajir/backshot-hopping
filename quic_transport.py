@@ -117,24 +117,51 @@ class _FragmentingSocket:
 
 class QUICClient:
     """
-    TLS 1.3 client transport.
+    TLS 1.3 client transport with resilient retry logic.
     Connects to server on a TCP port (for TLS handshake + reliable control).
     Data is sent as length-prefixed records over TLS.
+    Includes exponential backoff retry mechanism for unreliable networks.
     """
 
     def __init__(self, host: str, port: int, cafile=None, verify=False,
-                 connect_timeout: float = 5.0):
+                 connect_timeout: float = 5.0, max_retries: int = 5,
+                 initial_backoff_ms: int = 500):
         self.host    = host
         self.port    = port
         self.cafile  = cafile
         self.verify  = verify
         self.connect_timeout = connect_timeout
+        self.max_retries = max_retries
+        self.initial_backoff_ms = initial_backoff_ms
         self._sock   = None
         self._ssl    = None
         self._recv_q = queue.Queue()
         self._running = False
 
-    def connect(self) -> bool:
+    def connect(self, retry: bool = True) -> bool:
+        """Connect with exponential backoff retry mechanism."""
+        if not retry:
+            return self._attempt_connect()
+        
+        backoff_ms = self.initial_backoff_ms
+        for attempt in range(self.max_retries):
+            log.info(f"[QUIC] connection attempt {attempt + 1}/{self.max_retries} "
+                    f"to {self.host}:{self.port}")
+            
+            if self._attempt_connect():
+                return True
+            
+            if attempt < self.max_retries - 1:
+                wait_sec = backoff_ms / 1000.0
+                log.warning(f"[QUIC] retrying in {wait_sec:.1f}s (exponential backoff)")
+                time.sleep(wait_sec)
+                backoff_ms = min(backoff_ms * 2, 10000)  # Cap at 10 seconds
+        
+        log.error(f"[QUIC] failed to connect after {self.max_retries} attempts")
+        return False
+
+    def _attempt_connect(self) -> bool:
+        """Single connection attempt without retries."""
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         if not self.verify or self.cafile is None:
             ctx.check_hostname = False
@@ -152,8 +179,14 @@ class QUICClient:
             log.info(f"[QUIC] connected to {self.host}:{self.port} "
                      f"cipher={self._ssl.cipher()}")
             return True
+        except socket.timeout:
+            log.warning(f"[QUIC] connection timeout ({self.connect_timeout}s)")
+            return False
+        except ConnectionRefusedError:
+            log.warning(f"[QUIC] connection refused by {self.host}:{self.port}")
+            return False
         except Exception as e:
-            log.warning(f"[QUIC] connect failed: {e}")
+            log.warning(f"[QUIC] connection error: {e}")
             return False
 
     def send(self, data: bytes):

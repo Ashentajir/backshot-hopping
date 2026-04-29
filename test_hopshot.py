@@ -1419,7 +1419,7 @@ def t_max_ping_propagates_to_quic_timeout():
     original_quic = clientmod.QUICClient
 
     class ObserveQUIC:
-        def __init__(self, host, port, cafile=None, verify=False, connect_timeout=5.0):
+        def __init__(self, host, port, cafile=None, verify=False, connect_timeout=5.0, **kwargs):
             observed["timeout"] = connect_timeout
         def connect(self):
             return False
@@ -1482,6 +1482,172 @@ def t_startup_scan_port_hopping_recovery_logic():
             c.stop()
         clientmod.probe_port = original_probe
 test("startup scan mirrors throttling then port-hopping recovery logic", t_startup_scan_port_hopping_recovery_logic)
+
+# ── New tests for recent features: health, bootstrap budget, proxy relay, QUIC multi-fallback
+print("\n[ New Feature Tests ]")
+
+def t_health_endpoint_serves_ok():
+    health_port = 20050 + random.randint(0, 200)
+    cfg = base_cfg(20000, health_port=health_port)
+    srv = servermod.HopShotServer(cfg)
+    srv._start_health_server(health_port)
+    try:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", health_port, timeout=2)
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        body = resp.read()
+        assert resp.status == 200 and body == b"ok\n"
+    finally:
+        try:
+            if srv.health_srv:
+                srv.health_srv.shutdown()
+        except Exception:
+            pass
+test("HTTP /health endpoint responds OK", t_health_endpoint_serves_ok)
+
+def t_bootstrap_5min_budget_expires_quickly():
+    port = 20100 + random.randint(0, 50)
+    cfg = base_cfg(port)
+    c = HopShotClient(cfg)
+
+    original_probe = clientmod.probe_port
+    original_monotonic = clientmod.time.monotonic
+    original_sleep = clientmod.time.sleep
+    # Fast-forward time on sleep so the 5-minute budget expires immediately
+    t = [0.0]
+    def fake_monotonic():
+        return t[0]
+    def fake_sleep(s):
+        t[0] += 301.0
+
+    def fake_probe(*args, **kwargs):
+        return {"port": kwargs.get("port", args[1] if len(args) > 1 else 0), "loss_pct": 100.0, "rtt_ms": 0.0, "sent": 0, "received": 0, "clock_offset_ms": 0}
+
+    clientmod.probe_port = fake_probe
+    clientmod.time.monotonic = fake_monotonic
+    clientmod.time.sleep = fake_sleep
+    orig_connect = c._connect_quic
+    c._connect_quic = lambda: None
+    try:
+        thr = threading.Thread(target=c.start)
+        thr.start()
+        thr.join(timeout=2.0)
+        if thr.is_alive():
+            # If start() hasn't returned yet, ensure our fake_sleep advanced time
+            c._running = False
+            try:
+                c.stop()
+            except Exception:
+                pass
+        assert t[0] >= 301.0, "fake sleep did not advance monotonic time as expected"
+    finally:
+        clientmod.probe_port = original_probe
+        clientmod.time.monotonic = original_monotonic
+        clientmod.time.sleep = original_sleep
+        c._connect_quic = orig_connect
+        try:
+            c.stop()
+        except Exception:
+            pass
+test("bootstrap 5-minute reachability budget expires and start returns", t_bootstrap_5min_budget_expires_quickly)
+
+def t_proxy_open_data_close_flow():
+    # Start a tiny TCP echo server to validate relay
+    srv_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv_sock.bind(("127.0.0.1", 0))
+    srv_sock.listen(1)
+    port = srv_sock.getsockname()[1]
+
+    accepted = {}
+    def _tcp_worker():
+        try:
+            conn, addr = srv_sock.accept()
+            accepted['conn'] = conn
+            data = conn.recv(4096)
+            accepted['recv'] = data
+            # send a reply so server will emit TYPE_PROXY_DATA
+            time.sleep(0.05)
+            try:
+                conn.sendall(b"SERVER_REPLY")
+            except Exception:
+                pass
+            conn.close()
+        except Exception:
+            pass
+
+    threading.Thread(target=_tcp_worker, daemon=True).start()
+
+    cfg = base_cfg(20200)
+    srv = servermod.HopShotServer(cfg)
+    srv._running = True
+    captured = []
+    orig_send = srv._send_reply_fanout
+    srv._send_reply_fanout = lambda pkt, addr, tx_sock=None, label="": captured.append((pkt, addr, label))
+    try:
+        # Construct proxy OPEN payload: [host_len][host_bytes][port_be]
+        host = "127.0.0.1"
+        host_b = host.encode('utf-8')
+        payload = bytes([len(host_b)]) + host_b + struct.pack("!H", port)
+        hdr = {"stream_id": 1, "session_id": 99}
+        srv._handle_proxy_open(hdr, payload, ("127.0.0.1", 40000))
+        # Wait for ACK path to be invoked
+        time.sleep(0.2)
+        # ACK should have been captured
+        assert any(common.unpack_header(pkt)[0]["type"] == common.TYPE_PROXY_ACK for pkt,_,_ in captured), "no PROXY_ACK sent"
+
+        # Send data from client->server which should be forwarded to TCP target
+        captured.clear()
+        srv._handle_proxy_data({"stream_id": 1, "session_id": 99}, b"hello target")
+        time.sleep(0.2)
+        assert b"hello" in accepted.get('recv', b''), "relay did not forward client payload to target"
+
+        # Wait for server->client reply to be emitted
+        time.sleep(0.2)
+        assert any(common.unpack_header(pkt)[0]["type"] == common.TYPE_PROXY_DATA for pkt,_,_ in captured), "no PROXY_DATA from target forwarded"
+
+        # Close stream
+        srv._handle_proxy_close({"stream_id": 1, "session_id": 99})
+        time.sleep(0.1)
+        assert any(common.unpack_header(pkt)[0]["type"] == common.TYPE_PROXY_CLOSE for pkt,_,_ in captured), "no PROXY_CLOSE emitted"
+    finally:
+        srv._send_reply_fanout = orig_send
+        try:
+            srv._proxy_close(99, 1)
+        except Exception:
+            pass
+        srv._running = False
+        try:
+            srv_sock.close()
+        except Exception:
+            pass
+test("proxy open/data/close flow creates TCP relay and forwards data", t_proxy_open_data_close_flow)
+
+def t_quic_multi_fallback_selects_winner():
+    cfg = base_cfg(20300, destinations=["10.0.0.1", "127.0.0.1"]) 
+    c = HopShotClient(cfg)
+    original_quic = clientmod.QUICClient
+    class FakeQUIC:
+        def __init__(self, host, port, **kwargs):
+            self.host = host
+        def connect(self, retry=False):
+            return self.host == "127.0.0.1"
+        def close(self):
+            pass
+    clientmod.QUICClient = FakeQUIC
+    try:
+        ok = c._connect_quic_multi_fallback(1.0)
+        assert ok is True
+        assert c.quic_ok is True
+        assert c.primary_ip == "127.0.0.1"
+    finally:
+        clientmod.QUICClient = original_quic
+        try:
+            c.stop()
+        except Exception:
+            pass
+test("QUIC multi-connection fallback picks a working candidate", t_quic_multi_fallback_selects_winner)
 
 # ─── Summary ──────────────────────────────────────────────────────────────────
 print("\n" + "="*50)

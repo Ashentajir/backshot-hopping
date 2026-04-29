@@ -17,8 +17,11 @@ set "SERVER=127.0.0.1"
 set "DESTINATIONS=127.0.0.1"
 set "PORT=10000"
 set "QUIC_PORT=10001"
+set "HEALTH_PORT=10002"
 set "SEED=change-me"
 set "PROFILE=balanced"
+set "SERVICE_MODE=tunnel"
+set "PROXY_LISTEN=127.0.0.1:1080"
 set "JITTER=64"
 set "PORT_MIN=10000"
 set "PORT_MAX=65000"
@@ -60,7 +63,8 @@ echo.
 echo %C_BOLD%Quick status:%C_RESET%
 echo   %C_WHITE%Server:%C_RESET% %SERVER%   %C_WHITE%Port:%C_RESET% %PORT%   %C_WHITE%QUIC:%C_RESET% %QUIC_PORT%
 echo   %C_WHITE%Profile:%C_RESET% %PROFILE%   %C_WHITE%Adaptive mode:%C_RESET% %ADAPTIVE_MODE%
-echo   %C_WHITE%Max ping:%C_RESET% %MAX_PING_MS%ms
+echo   %C_WHITE%Max ping:%C_RESET% %MAX_PING_MS%ms   %C_WHITE%Health:%C_RESET% %HEALTH_PORT%
+echo   %C_WHITE%Service:%C_RESET% %SERVICE_MODE%   %C_WHITE%Proxy listen:%C_RESET% %PROXY_LISTEN%
 echo   %C_WHITE%Tunnel:%C_RESET% %TUNNEL_MODE%   %C_WHITE%Relay:%C_RESET% %TUNNEL_UDP_BIND% -^> %TUNNEL_UDP_TARGET%
 echo   %C_WHITE%Hop disabled:%C_RESET% %DISABLE_HOP%   %C_WHITE%Fixed hop:%C_RESET% %FIXED_HOP_MS%   %C_WHITE%Burst:%C_RESET% %MANUAL_BURST%
 echo   %C_WHITE%Obfs/Masq/Rand:%C_RESET% %OBFS%/%MASQ%/%RAND_SRC%   %C_WHITE%Verbose/JSON:%C_RESET% %VERBOSE%/%JSON_LOGS%
@@ -72,12 +76,14 @@ echo %C_GREEN%4.%C_RESET% Transport menu
 echo %C_GREEN%5.%C_RESET% Advanced core menu
 echo %C_GREEN%6.%C_RESET% Logging menu
 echo %C_GREEN%7.%C_RESET% Tunnel menu
+echo %C_GREEN%8.%C_RESET% Service menu (tunnel/proxy)
 echo %C_GREEN%S.%C_RESET% Save config only
 echo %C_GREEN%X.%C_RESET% Exit
 echo.
-choice /c 1234567SX /n /m "Select an option:"
-if errorlevel 9 goto :end
-if errorlevel 8 goto :save_only
+choice /c 12345678SX /n /m "Select an option:"
+if errorlevel 10 goto :end
+if errorlevel 9 goto :save_only
+if errorlevel 8 goto :service_menu
 if errorlevel 7 goto :tunnel_menu
 if errorlevel 6 goto :logs_menu
 if errorlevel 5 goto :advanced_menu
@@ -86,6 +92,27 @@ if errorlevel 3 goto :mode_menu
 if errorlevel 2 goto :network_menu
 if errorlevel 1 goto :start_client
 goto :main_menu
+
+:service_menu
+cls
+echo %C_CYAN%%C_BOLD%[ Service Menu ]%C_RESET%
+echo.
+echo   Service mode: %SERVICE_MODE%
+echo   Proxy listen: %PROXY_LISTEN%
+echo   Health port: %HEALTH_PORT%
+echo   Transport strategy: UDP raw always + QUIC parallel
+echo.
+echo %C_GREEN%1.%C_RESET% Change service mode (tunnel/proxy)
+echo %C_GREEN%2.%C_RESET% Set proxy listen endpoint
+echo %C_GREEN%3.%C_RESET% Set health port
+echo %C_GREEN%B.%C_RESET% Back
+echo.
+choice /c 123B /n /m "Select an option:"
+if errorlevel 4 goto :main_menu
+if errorlevel 3 goto :change_health_port
+if errorlevel 2 goto :change_proxy_listen
+if errorlevel 1 goto :change_service_mode
+goto :service_menu
 
 :tunnel_menu
 cls
@@ -290,6 +317,32 @@ set /p "QUIC_PORT=QUIC port (B=back) [%QUIC_PORT%]: "
 if /i "%QUIC_PORT%"=="b" set "PORT=%OLD_PORT%" & set "QUIC_PORT=%OLD_QUIC_PORT%" & goto :network_menu
 if not defined QUIC_PORT set "QUIC_PORT=%OLD_QUIC_PORT%"
 goto :network_menu
+
+:change_service_mode
+echo.
+echo Choose service mode:
+echo   1. tunnel
+echo   2. proxy
+echo   B. back
+choice /c 12B /n /m "Service mode:"
+if errorlevel 3 goto :service_menu
+if errorlevel 2 set "SERVICE_MODE=proxy"
+if errorlevel 1 set "SERVICE_MODE=tunnel"
+goto :service_menu
+
+:change_proxy_listen
+set "OLD_PROXY_LISTEN=%PROXY_LISTEN%"
+set /p "PROXY_LISTEN=Proxy listen host:port (B=back) [%PROXY_LISTEN%]: "
+if /i "%PROXY_LISTEN%"=="b" set "PROXY_LISTEN=%OLD_PROXY_LISTEN%" & goto :service_menu
+if not defined PROXY_LISTEN set "PROXY_LISTEN=%OLD_PROXY_LISTEN%"
+goto :service_menu
+
+:change_health_port
+set "OLD_HEALTH_PORT=%HEALTH_PORT%"
+set /p "HEALTH_PORT=Health HTTP port (B=back) [%HEALTH_PORT%]: "
+if /i "%HEALTH_PORT%"=="b" set "HEALTH_PORT=%OLD_HEALTH_PORT%" & goto :service_menu
+if not defined HEALTH_PORT set "HEALTH_PORT=%OLD_HEALTH_PORT%"
+goto :service_menu
 
 :toggle_adaptive
 choice /c YNB /n /m "Toggle adaptive auto-mode? (Y=yes, N=no, B=back): "
@@ -614,8 +667,10 @@ set "DEST_JSON=!DEST_CLEAN:,=\",\"!"
   echo   "port_max": %PORT_MAX%,
   echo   "shared_seed": "%SEED%",
   echo   "profile": "%PROFILE%",
+  echo   "service_mode": "%SERVICE_MODE%",
   echo   "adaptive_mode": %ADAPTIVE_MODE%,
   echo   "max_ping_ms": %MAX_PING_MS%,
+  echo   "health_port": %HEALTH_PORT%,
   echo   "disable_hop": %DISABLE_HOP%,
   echo   "obfs": %OBFS%,
   echo   "rand_src_port": %RAND_SRC%,
@@ -624,6 +679,7 @@ set "DEST_JSON=!DEST_CLEAN:,=\",\"!"
   echo   "fixed_hop_ms": %FIXED_HOP_MS%,
   echo   "manual_burst_mult": %MANUAL_BURST%,
   echo   "keepalive_interval_sec": %KEEPALIVE_SEC%,
+  echo   "proxy_listen": "%PROXY_LISTEN%",
   echo   "tunnel_mode": "%TUNNEL_MODE%",
   echo   "tunnel_iface": "%TUNNEL_IFACE%",
   echo   "tunnel_mtu": %TUNNEL_MTU%,

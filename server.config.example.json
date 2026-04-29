@@ -1,6 +1,8 @@
 {
   "listen_port": 10000,
   "quic_port": 10001,
+  "health_port": 10002,
+  "service_mode": "tunnel",
   "port_min": 10000,
   "port_max": 65000,
   "shared_seed": "change-me",
